@@ -12,13 +12,31 @@
   margin: 0;
   padding: 0;
   box-sizing: border-box;
+  scroll-behavior: smooth;
 }
 
 body {
   font-family: 'Inter', sans-serif;
-  background: #0a0a0a;
+  background: radial-gradient(circle at top, #111 0%, #0a0a0a 60%);
   color: #fff;
-  line-height: 1.6;
+}
+
+/* subtle moving glow */
+body::before {
+  content: "";
+  position: fixed;
+  width: 600px;
+  height: 600px;
+  background: radial-gradient(circle, rgba(76,175,80,0.15), transparent);
+  top: -200px;
+  left: -200px;
+  z-index: -1;
+  animation: moveGlow 10s infinite alternate ease-in-out;
+}
+
+@keyframes moveGlow {
+  0% { transform: translate(0,0); }
+  100% { transform: translate(200px,150px); }
 }
 
 .container {
@@ -29,12 +47,15 @@ body {
 
 .hero {
   text-align: center;
-  padding: 100px 20px;
+  padding: 120px 20px;
 }
 
 .hero h1 {
-  font-size: 48px;
+  font-size: 52px;
   font-weight: 600;
+  background: linear-gradient(90deg, #4CAF50, #2ecc71);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
 }
 
 .hero p {
@@ -47,41 +68,41 @@ body {
   display: inline-block;
   margin-top: 30px;
   padding: 14px 28px;
-  border-radius: 10px;
+  border-radius: 12px;
   background: linear-gradient(135deg, #4CAF50, #2ecc71);
   color: white;
   text-decoration: none;
   font-weight: 500;
-  transition: 0.3s;
+  transition: all 0.3s ease;
   box-shadow: 0 0 0 rgba(76, 175, 80, 0.7);
 }
 
 .btn:hover {
-  transform: scale(1.05);
-  box-shadow: 0 0 20px rgba(76, 175, 80, 0.6);
+  transform: translateY(-3px) scale(1.05);
+  box-shadow: 0 0 25px rgba(76, 175, 80, 0.7);
 }
 
 /* Sections */
 .section {
-  padding: 80px 0;
+  padding: 90px 0;
 }
 
 .section h2 {
   text-align: center;
-  margin-bottom: 40px;
-  font-size: 32px;
+  margin-bottom: 50px;
+  font-size: 34px;
 }
 
-/* Features grid */
+/* Features */
 .features {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-  gap: 20px;
+  gap: 25px;
 }
 
-/* Cards */
 .card {
-  background: #141414;
+  background: rgba(20,20,20,0.7);
+  backdrop-filter: blur(10px);
   padding: 25px;
   border-radius: 15px;
   border: 1px solid #222;
@@ -89,8 +110,9 @@ body {
 }
 
 .card:hover {
-  transform: translateY(-8px) scale(1.02);
+  transform: translateY(-10px) scale(1.03);
   border-color: #4CAF50;
+  box-shadow: 0 10px 30px rgba(0,0,0,0.5);
 }
 
 .card h3 {
@@ -99,26 +121,20 @@ body {
 
 .card p {
   color: #aaa;
-  font-size: 14px;
 }
 
 /* Demo */
-.demo {
-  text-align: center;
-}
-
 iframe {
   width: 100%;
-  max-width: 700px;
-  height: 400px;
+  max-width: 750px;
+  height: 420px;
   border-radius: 12px;
-  border: none;
 }
 
 /* Footer */
 .footer {
   text-align: center;
-  padding: 40px;
+  padding: 50px;
   border-top: 1px solid #222;
   color: #777;
 }
@@ -126,7 +142,7 @@ iframe {
 /* Animations */
 .fade-in {
   opacity: 0;
-  transform: translateY(30px);
+  transform: translateY(40px);
   transition: all 0.8s ease;
 }
 
@@ -174,8 +190,8 @@ iframe {
 </div>
 
 <!-- DEMO -->
-<div class="section demo fade-in">
-  <div class="container">
+<div class="section fade-in">
+  <div class="container" style="text-align:center;">
     <h2>See it in action</h2>
     <iframe src="https://www.youtube.com/embed/YOUR_VIDEO"></iframe>
   </div>
@@ -195,12 +211,13 @@ iframe {
   <p>Email: your@email.com</p>
 </div>
 
-<!-- Animation Script -->
 <script>
 const observer = new IntersectionObserver(entries => {
-  entries.forEach(entry => {
+  entries.forEach((entry, index) => {
     if (entry.isIntersecting) {
-      entry.target.classList.add('show');
+      setTimeout(() => {
+        entry.target.classList.add('show');
+      }, index * 100);
     }
   });
 });
