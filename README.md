@@ -8,167 +8,108 @@ lib/
   models/
     student.dart                     ← Student + embedding model
     attendance_record.dart           ← Attendance record model
+    group.dart                       New grouping system
   services/
     database_service.dart            ← SQLite CRUD (students + attendance)
-    face_embedding_service.dart      ← ML Kit detection + TFLite inference
+    face_service.dart                Onnx + SCRFD Detection handling
     enrollment_service.dart          ← One-time enrollment pipeline
-    attendance_service.dart          ← Session logic + CSV export
+    attendance_service.dart          ← Session logic + CSV now EXCEL export
+    app_log.dart                     Handles app logs via screen.
+    beacon_service.dart              Firebase handler.
+    liveness_service.dart            Anti-spoof mechanism
+    restore_service.dart             Account restoration
+    stress_test.service.dart         Simulator for 1000 students, stress test.
+    transfer_service.dart            Handles local data transfer.
+
   screens/
     home_screen.dart                 ← Home with two action cards
     enrollment_screen.dart           ← Progress screen (first launch only)
     attendance_screen.dart           ← Live camera + real-time recognition
     records_screen.dart              ← Past sessions, export to CSV
+    group_form_screen.dart           Formation od Groups.
+    main_shell.dart
+    onboarding_screen.dart           Login system
+    restore_progress_screen.dart     Progress bar
+    roster_screen.dart               Student roster
+    select_group_screen              Group selection
+    settings_screen.dart             Settings
+  
 
 assets/
   students/
-    manifest.txt                     ← List of image filenames (YOU EDIT THIS)
-    John Smith.jpg                   ← Student photos (YOU ADD THESE)
-    Alice Johnson.png
-    ...
+    redundant.
+
   models/
-    mobilefacenet.tflite             ← YOU MUST DOWNLOAD THIS (see below)
+    w600k_mbf.onnx                   Onnx handler.
+    det_500m.onnx                    SCRFD model.
+    best_model_quantized.onnx        Anti-spoof system.
 
 android/
   app/
     build.gradle                     ← minSdk 24, noCompress tflite
     src/main/
-      AndroidManifest.xml            ← CAMERA permission + ML Kit meta-data
+      AndroidManifest.xml            ← CAMERA permission
       res/xml/file_paths.xml         ← FileProvider paths for share_plus
   build.gradle                       ← Project-level gradle
 ```
 
 ---
 
-## Step 1 — Download MobileFaceNet model
+## Step 1 — Onboarding
 
-Download `mobilefacenet.tflite` from:
-https://github.com/shaqian/tflite-models/raw/master/mobilefacenet.tflite
-
-Place it at: `assets/models/mobilefacenet.tflite`
-
-Model specs:
-- Input:  [1, 112, 112, 3]  float32 (normalized to [-1, 1])
-- Output: [1, 128]          float32 (face embedding vector)
-- Size:   ~1.9 MB
+Download the app and login using gievn credentials.
+If account already exists, data will be restored automatically.
+Local data transfer also permitted.
 
 ---
 
-## Step 2 — Add student photos
+## Step 2 — Add student (enrollment)
 
-1. Take or collect one clear, well-lit photo of each student (face clearly visible).
-2. Name the file exactly as you want the student's name to appear:
-   - `John Smith.jpg`
-   - `Priya Sharma.png`
-3. Copy files into `assets/students/`
-4. Open `assets/students/manifest.txt` and list every filename, one per line.
+1. Navigate to student roster, or register through home screen.
+2. Input student's name and roll number.
+3. Take or collect atleast one clear, well-lit photo of student (face clearly visible). This is auto captured.
+4. Save the screen.
+5. Add student into required domain as needed.
 
 **Photo guidelines:**
-- Minimum 200×200 pixels (larger is better)
+- Photo auto-captured.
 - Face should be centred, not obstructed
 - One face per image
-- Good, even lighting; avoid harsh shadows
+- Good, even lighting; avoid harsh shadows or glares.
 - Avoid sunglasses, masks, or extreme angles
 
 ---
 
-## Step 3 — Update pubspec.yaml if needed
+## Step 3 — Take Attendance
 
-The assets block is already configured:
-```yaml
-flutter:
-  assets:
-    - assets/students/
-    - assets/models/
-```
+1. Navigate to home screen to take attendance.
+2. Select domain.
+3. Let the app load the camera, if the screen freezes, the app will automatically reload the camera.
+4. Student presents face to camera (front or back) to mark attendance.
+5. Save and Done. 
 
 ---
 
-## Step 4 — Install dependencies
+## Step 4 — Check Attendance Records
 
-```bash
-flutter pub get
-```
-
----
-
-## Step 5 — Run on Android
-
-```bash
-flutter run
-```
-
-On first launch the app will:
-1. Show the Enrollment screen
-2. Automatically load each image from assets
-3. Run ML Kit + MobileFaceNet on each image
-4. Save the 128-d embedding to local SQLite
-5. Navigate to Home screen
-
-This happens **once only**. Subsequent launches go straight to Home.
+1. Navigate to record, select year, month, date and session.
+2. Select timestamp, and edit data if needed.
+3. Reload roster if needed.
+4. Export data to excel via Export function.
 
 ---
 
-## How recognition works at runtime
+## Step 5 — Admin Dashboard
 
-1. Camera stream starts (front camera preferred)
-2. Every ~400ms a frame is grabbed
-3. ML Kit detects faces in the frame
-4. Each detected face is cropped and resized to 112×112
-5. MobileFaceNet produces a 128-d embedding
-6. Cosine similarity is computed against every stored student embedding
-7. If similarity ≥ **0.75** → student is marked present
-8. The student's name appears in a green badge and the chip list
-9. When you press **Finish**:
-   - Present list is finalised
-   - All students NOT seen are marked absent
-   - Session is saved to SQLite
+1. Navigate to https://notreal8.github.io/GIFT_DB/#
+2. Login using given credentials to view data.
 
 ---
 
-## Adjusting the recognition threshold
+## Exporting account data.
 
-In `lib/services/attendance_service.dart`:
-```dart
-static const double matchThreshold = 0.75;
-```
-- **Raise to 0.80** → stricter, fewer false positives (someone else marked present)
-- **Lower to 0.70** → more lenient, fewer false negatives (real student not detected)
-
-Start at 0.75 and adjust based on your testing.
+- Navigate to **Settings**
+- Select export data
 
 ---
 
-## Adding new students later
-
-1. Add their photo to `assets/students/`
-2. Add the filename to `manifest.txt`
-3. In the app → tap the ↻ icon on the Home screen → "Re-enroll"
-4. The app reprocesses all images and saves new embeddings
-
-Attendance records are **not** deleted during re-enrollment.
-
----
-
-## Exporting attendance
-
-- Go to **View Records**
-- Select a date
-- Tap the download icon (top right)
-- Choose to share/save the CSV via Android share sheet
-
-CSV format:
-```
-Date, Session, Student Name, Status
-2024-09-01, 09:15 AM, Alice Johnson, present
-2024-09-01, 09:15 AM, Bob Kumar, absent
-```
-
----
-
-## Known limitations & tips
-
-- **One face per frame**: the app matches the largest detected face. If multiple faces appear, it identifies each one but matches the largest. Walk students past the camera one at a time for best results.
-- **Glasses / head coverings**: may reduce accuracy slightly. Enroll with the student wearing what they typically wear.
-- **Lighting**: ensure the room is well-lit. Very dark environments will cause missed detections.
-- **Camera permission**: must be granted the first time. If denied, go to Android Settings → Apps → FaceAttendance → Permissions.
-- **Model not bundled**: if you see "model not found" errors, confirm `mobilefacenet.tflite` is in `assets/models/` and listed in `pubspec.yaml`.
