@@ -1,0 +1,21 @@
+# List every student image filename here, one per line.
+# The filename (without extension) becomes the student's name.
+# Supported formats: .jpg  .jpeg  .png  .webp
+#
+# Rules:
+#   - One face per image, clearly visible, good lighting
+#   - Image should be at least 200×200 px
+#   - Name must be unique (case-insensitive won't deduplicate)
+#   - Lines starting with # are ignored
+aarush upadhyay_1.jpg
+aarush upadhyay_2.jpg
+aarush upadhyay_3.jpg
+Donald Trump_1.jpg
+Donald Trump_2.jpg
+Donald Trump_3.jpg
+Narendra Modi_1.jpg
+Narendra Modi_2.jpg
+Narendra Modi_3.jpg
+Vladimir Putin_1.jpg
+Vladimir Putin_2.jpg
+Vladimir Putin_3.jpg

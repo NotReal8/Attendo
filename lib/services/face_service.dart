@@ -1,0 +1,935 @@
+// lib/services/face_service.dart
+import 'dart:io';
+import 'dart:ui';
+import 'dart:math';
+import 'dart:typed_data';
+import 'package:image/image.dart' as img;
+import 'package:onnxruntime/onnxruntime.dart';
+import 'package:flutter/services.dart';
+import 'app_log.dart';
+import '../models/student.dart';
+
+class MatchResult {
+  final String name;
+  final double confidence;
+  final double similarity;
+
+  MatchResult({required this.name, required this.confidence, required this.similarity});
+
+  String get confidencePercent => '${(confidence * 100).toStringAsFixed(1)}%';
+  String get similarityPercent => '${(similarity * 100).toStringAsFixed(1)}%';
+}
+
+class FaceDetectionResult {
+  final List<MatchResult> matches;
+  final Rect? faceBox;
+  final double? faceEulerY;
+  final double? faceEulerX;
+  final double? faceWidthRatio;
+  /// Dimensions of the baked (orientation-corrected) image SCRFD ran on
+  final Size? bakedImageSize;
+  /// 5-point landmarks normalized to [0..1] in baked-image space.
+  /// Order: left-eye, right-eye, nose, left-mouth, right-mouth.
+  final List<Offset>? landmarks;
+
+  FaceDetectionResult({
+    required this.matches,
+    this.faceBox,
+    this.faceEulerY,
+    this.faceEulerX,
+    this.faceWidthRatio,
+    this.bakedImageSize,
+    this.landmarks,
+  });
+}
+
+/// Internal SCRFD detection result — raw pixel coords
+class _ScrfdFace {
+  final Rect box; // pixel coords
+  final double score;
+  /// 5 keypoints in pixel coords (baked image space).
+  /// Order: left-eye, right-eye, nose tip, left-mouth corner, right-mouth corner.
+  /// Empty list when kps output was absent (fallback path).
+  final List<Offset> kps;
+
+  _ScrfdFace(this.box, this.score, {List<Offset>? kps})
+      : kps = kps ?? const [];
+}
+
+class FaceService {
+  static final FaceService _i = FaceService._();
+  factory FaceService() => _i;
+  FaceService._();
+
+  OrtSession? _detSession;  // SCRFD det_500m
+  String?     _detInputName;
+  OrtSession? _embSession;  // ArcFace w600k_mbf
+  String?     _embInputName;
+
+  bool _initializing = false;
+  bool _ready        = false;
+  bool _inferencing  = false;
+
+  static const int    _outputSize     = 512;
+  static const double _matchThreshold = 0.40;
+
+  // SCRFD input size for det_500m
+  static const int _detSize = 640;
+
+  // ── ArcFace reference 5-point template (112×112) ─────────
+  // Standard InsightFace alignment target — same coordinates used during
+  // ArcFace training, so the model receives canonically-aligned faces.
+  static const List<Offset> _arcfaceTemplate = [
+    Offset(38.2946, 51.6963),   // left eye
+    Offset(73.5318, 51.5014),   // right eye
+    Offset(56.0252, 71.7366),   // nose tip
+    Offset(41.5493, 92.3655),   // left mouth corner
+    Offset(70.7299, 92.2041),   // right mouth corner
+  ];
+
+  // ── Temporal voting ───────────────────────────────────────
+
+  static const int _voteWindow    = 4;
+  static const int _votesRequired = 2;
+
+  final Map<String, List<double>> _voteBuffer = {};
+
+  bool castVote(String name, double similarity) {
+    final buf = _voteBuffer.putIfAbsent(name, () => []);
+    buf.add(similarity);
+    if (buf.length > _voteWindow) buf.removeAt(0);
+    final votes = buf.where((s) => s >= _matchThreshold).length;
+    appLog('[Vote] "$name": $votes/$_votesRequired '
+        '(latest sim=${(similarity * 100).toStringAsFixed(1)}%)');
+    return votes >= _votesRequired;
+  }
+
+  int voteBufferFor(String name) {
+    final buf = _voteBuffer[name];
+    if (buf == null) return 0;
+    return buf.where((s) => s >= _matchThreshold).length;
+  }
+
+  static int get votesRequired => _votesRequired;
+
+  void clearVotes(String name) {
+    _voteBuffer.remove(name);
+    appLog('[Vote] cleared "$name"');
+  }
+
+  void clearAllVotes() {
+    _voteBuffer.clear();
+    appLog('[Vote] all buffers cleared');
+  }
+
+  // ── Init ──────────────────────────────────────────────────
+
+  Future<void> init() async {
+    if (_ready) return;
+    if (_initializing) {
+      while (_initializing) await Future.delayed(const Duration(milliseconds: 50));
+      return;
+    }
+    _initializing = true;
+    appLog('[FaceService] init(): starting');
+    try {
+      OrtEnv.instance.init();
+      appLog('[FaceService] OrtEnv initialized ✅');
+
+      final opts = OrtSessionOptions()
+        ..setInterOpNumThreads(2)
+        ..setIntraOpNumThreads(2);
+
+      // Load SCRFD detector
+      appLog('[FaceService] Loading det_500m.onnx...');
+      final detBytes = (await rootBundle.load('assets/models/det_500m.onnx'))
+          .buffer.asUint8List();
+      _detSession   = OrtSession.fromBuffer(detBytes, opts);
+      _detInputName = _detSession!.inputNames.first;
+      appLog('[FaceService] det_500m loaded ✅ input=$_detInputName '
+          'outputs=${_detSession!.outputNames}');
+
+      // Load ArcFace embedder
+      appLog('[FaceService] Loading w600k_mbf.onnx...');
+      final embBytes = (await rootBundle.load('assets/models/w600k_mbf.onnx'))
+          .buffer.asUint8List();
+      _embSession   = OrtSession.fromBuffer(embBytes, opts);
+      _embInputName = _embSession!.inputNames.first;
+      appLog('[FaceService] w600k_mbf loaded ✅ input=$_embInputName');
+
+      _ready = true;
+      appLog('[FaceService] init complete ✅');
+    } catch (e, st) {
+      appLog('[FaceService] init FAIL: $e');
+      appLog('[FaceService] stack: ${st.toString().split('\n').take(4).join(' | ')}');
+    } finally {
+      _initializing = false;
+    }
+  }
+
+  bool get tfliteLoaded => _embSession != null;
+  double get matchThreshold => _matchThreshold;
+
+  // ── SCRFD detection ───────────────────────────────────────
+  //
+  // det_500m outputs depend on the export but buffalo_s typically uses
+  // the "single-stride" export which gives:
+  //   output[0]: scores  [1, N, 1]  or  [1, N]
+  //   output[1]: boxes   [1, N, 4]  in xyxy pixel coords (on _detSize input)
+  //
+  // We resize to 640×640, run inference, parse boxes, rescale to original.
+
+  Future<List<_ScrfdFace>> _detectScrfd(Uint8List jpegBytes) async {
+    final session   = _detSession;
+    final inputName = _detInputName;
+    if (session == null || inputName == null) {
+      appLog('[SCRFD] session null — skipping');
+      return [];
+    }
+
+    // Decode + resize to 640×640
+    final raw = img.decodeImage(jpegBytes);
+    if (raw == null) { appLog('[SCRFD] decodeImage null'); return []; }
+    final baked = img.bakeOrientation(raw);
+    final origW = baked.width.toDouble();
+    final origH = baked.height.toDouble();
+
+    final resized = img.copyResize(baked,
+        width: _detSize, height: _detSize,
+        interpolation: img.Interpolation.linear);
+
+    // NCHW [1,3,640,640] — RGB, (pixel/255 - mean) / std
+    // SCRFD uses mean=[127.5,127.5,127.5] std=[128,128,128] same as ArcFace
+    final input = Float32List(1 * 3 * _detSize * _detSize);
+    for (int py = 0; py < _detSize; py++) {
+      for (int px = 0; px < _detSize; px++) {
+        final p      = resized.getPixel(px, py);
+        final offset = py * _detSize + px;
+        // BGR order — det_500m is an InsightFace model trained on BGR, same as ArcFace
+        input[0 * _detSize * _detSize + offset] = (p.b.toDouble() - 127.5) / 128.0;
+        input[1 * _detSize * _detSize + offset] = (p.g.toDouble() - 127.5) / 128.0;
+        input[2 * _detSize * _detSize + offset] = (p.r.toDouble() - 127.5) / 128.0;
+      }
+    }
+
+    OrtValueTensor? tensor;
+    List<OrtValue?>? outputs;
+    try {
+      tensor  = OrtValueTensor.createTensorWithDataList(input, [1, 3, _detSize, _detSize]);
+      outputs = await session.runAsync(OrtRunOptions(), {inputName: tensor});
+
+      if (outputs == null || outputs.isEmpty) {
+        appLog('[SCRFD] null/empty outputs');
+        return [];
+      }
+
+      // Log output shapes — critical for diagnosing channel-first vs channel-last
+      appLog('[SCRFD] output count=${outputs.length}');
+      for (int i = 0; i < outputs.length; i++) {
+        final flat = <double>[];
+        _flatten(outputs[i]?.value, flat);
+        appLog('[SCRFD] output[$i] type=${outputs[i]?.value?.runtimeType} flatLen=${flat.length}');
+      }
+
+      return _parseScrfdOutputs(outputs, origW, origH);
+    } catch (e) {
+      appLog('[SCRFD] inference error: $e');
+      return [];
+    } finally {
+      tensor?.release();
+      outputs?.forEach((o) => o?.release());
+    }
+  }
+
+  /// Parse SCRFD outputs.
+  ///
+  /// det_500m exports in one of two layouts:
+  ///   Grouped:     [score_8, score_16, score_32, box_8, box_16, box_32, kps_8, kps_16, kps_32]
+  ///   Interleaved: [score_8, box_8, kps_8, score_16, box_16, kps_16, score_32, box_32, kps_32]
+  ///
+  /// We detect which by comparing flattened lengths: score tensors are smaller than box tensors.
+  List<_ScrfdFace> _parseScrfdOutputs(
+    List<OrtValue?> outputs, double origW, double origH) {
+  final scaleX = origW / _detSize;
+  final scaleY = origH / _detSize;
+
+  try {
+    if (outputs.length == 9) {
+      // Determine layout: grouped vs interleaved.
+      // In grouped layout: outputs[0,1,2]=scores, outputs[3,4,5]=boxes.
+      // In interleaved: outputs[0,3,6]=scores, outputs[1,4,7]=boxes.
+      // Score tensor size < box tensor size (boxes have 4 values per anchor vs 1 for score).
+      final flat0 = <double>[]; _flatten(outputs[0]?.value, flat0);
+      final flat1 = <double>[]; _flatten(outputs[1]?.value, flat1);
+      final flat3 = <double>[]; _flatten(outputs[3]?.value, flat3);
+
+      // If flat1.length == flat0.length * 4 → interleaved (box follows score at same stride)
+      // If flat3.length == flat0.length * 4 → grouped
+      final bool interleaved = flat1.length == flat0.length * 4;
+      appLog('[SCRFD] layout=${interleaved ? "interleaved" : "grouped"} '
+          'out0=${flat0.length} out1=${flat1.length} out3=${flat3.length}');
+
+      final strides = [8, 16, 32];
+      final List<_ScrfdFace> faces = [];
+
+      for (int s = 0; s < 3; s++) {
+        final int scoreIdx = interleaved ? s * 3     : s;
+        final int boxIdx   = interleaved ? s * 3 + 1 : s + 3;
+        final int kpsIdx   = interleaved ? s * 3 + 2 : s + 6;
+
+        final scoreFlat = <double>[];
+        final boxFlat   = <double>[];
+        final kpsFlat   = <double>[];
+        _flatten(outputs[scoreIdx]?.value, scoreFlat);
+        _flatten(outputs[boxIdx]?.value,   boxFlat);
+        _flatten(outputs[kpsIdx]?.value,   kpsFlat);
+
+        final stride = strides[s];
+        final cols   = _detSize ~/ stride;
+        const int anchorsPerCell = 2;
+        final n = scoreFlat.length;
+
+        appLog('[SCRFD] stride=$stride scoreIdx=$scoreIdx boxIdx=$boxIdx kpsIdx=$kpsIdx '
+            'scores=$n boxes=${boxFlat.length} kps=${kpsFlat.length}');
+
+        for (int i = 0; i < n; i++) {
+          final score = scoreFlat[i];
+          if (score < 0.5) continue;
+          if (boxFlat.length < (i + 1) * 4) break;
+
+          final cellIdx = i ~/ anchorsPerCell;
+          final anchorX = ((cellIdx % cols) + 0.5) * stride;
+          final anchorY = ((cellIdx ~/ cols) + 0.5) * stride;
+
+          // det_500m box output is always channel-last [N,4]: [l,t,r,b] per anchor.
+          // The removed channelFirst branch was a false positive — its condition
+          // (boxFlat.length == n*4) is always true for channel-last [N,4] output,
+          // so it incorrectly decoded boxes using strided offsets, corrupting all coords.
+          final double l = boxFlat[i * 4 + 0] * stride;
+          final double t = boxFlat[i * 4 + 1] * stride;
+          final double r = boxFlat[i * 4 + 2] * stride;
+          final double b = boxFlat[i * 4 + 3] * stride;
+
+          final x1 = (anchorX - l) * scaleX;
+          final y1 = (anchorY - t) * scaleY;
+          final x2 = (anchorX + r) * scaleX;
+          final y2 = (anchorY + b) * scaleY;
+
+          appLog('[SCRFD] stride=$stride i=$i score=${score.toStringAsFixed(2)} '
+              'box=[$x1,$y1,$x2,$y2]');
+
+          // ── Parse 5 keypoints ─────────────────────────────
+          // kps output [N, 10]: pairs (x0,y0, x1,y1, ..., x4,y4) — offsets from anchor,
+          // scaled by stride, then rescaled to original image coords.
+          List<Offset> kps = const [];
+          if (kpsFlat.length >= (i + 1) * 10) {
+            final base = i * 10;
+            kps = List.generate(5, (k) {
+              final px = (anchorX + kpsFlat[base + k * 2    ] * stride) * scaleX;
+              final py = (anchorY + kpsFlat[base + k * 2 + 1] * stride) * scaleY;
+              return Offset(px, py);
+            });
+            appLog('[SCRFD] stride=$stride i=$i kps=${kps.map((o) => '(${o.dx.toInt()},${o.dy.toInt()})').join(' ')}');
+          }
+
+          faces.add(_ScrfdFace(Rect.fromLTRB(x1, y1, x2, y2), score, kps: kps));
+        }
+        appLog('[SCRFD] stride=$stride anchors=$n faces_so_far=${faces.length}');
+      }
+
+      return _nms(faces);
+    }
+
+    // Fallback: original single/split logic
+    final flat = <double>[];
+    _flatten(outputs[0]?.value, flat);
+    if (flat.isEmpty) return [];
+
+    final stride = _guessStride(flat.length);
+    appLog('[SCRFD] fallback single tensor: total=${flat.length} stride=$stride');
+    if (stride == 0) return [];
+
+    final faces = <_ScrfdFace>[];
+    for (int i = 0; i * stride < flat.length; i++) {
+      final base  = i * stride;
+      final score = flat[base];
+      if (score < 0.5) continue;
+      faces.add(_ScrfdFace(
+        Rect.fromLTRB(
+          flat[base + 1] * scaleX, flat[base + 2] * scaleY,
+          flat[base + 3] * scaleX, flat[base + 4] * scaleY,
+        ),
+        score,
+      ));
+    }
+    return _nms(faces);
+  } catch (e) {
+    appLog('[SCRFD] parse error: $e');
+    return [];
+  }
+}
+
+  int _guessStride(int total) {
+    // Common strides: 15 (score+4box+10kps), 5 (score+4box)
+    for (final s in [15, 5]) {
+      if (total % s == 0) return s;
+    }
+    return 0;
+  }
+
+  void _flatten(dynamic value, List<double> out) {
+  if (value == null) return;
+  if (value is List) {
+    for (final v in value) _flatten(v, out);
+  } else if (value is double) {
+    out.add(value);
+  } else if (value is num) {
+    out.add(value.toDouble());
+  } else if (value is Float32List) {
+    for (final v in value) out.add(v);
+  }
+}
+
+  List<_ScrfdFace> _nms(List<_ScrfdFace> faces, {double iouThresh = 0.4}) {
+    faces.sort((a, b) => b.score.compareTo(a.score));
+    final keep = <_ScrfdFace>[];
+    final suppressed = List.filled(faces.length, false);
+    for (int i = 0; i < faces.length; i++) {
+      if (suppressed[i]) continue;
+      keep.add(faces[i]);
+      for (int j = i + 1; j < faces.length; j++) {
+        if (_iou(faces[i].box, faces[j].box) > iouThresh) suppressed[j] = true;
+      }
+    }
+    return keep;
+  }
+
+  double _iou(Rect a, Rect b) {
+    final ix1 = max(a.left,   b.left);
+    final iy1 = max(a.top,    b.top);
+    final ix2 = min(a.right,  b.right);
+    final iy2 = min(a.bottom, b.bottom);
+    final iw  = max(0.0, ix2 - ix1);
+    final ih  = max(0.0, iy2 - iy1);
+    final inter = iw * ih;
+    if (inter == 0) return 0;
+    final union = a.width * a.height + b.width * b.height - inter;
+    return inter / union;
+  }
+
+  // ── Public detectFaces wrapper (returns Rect list) ────────
+  //
+  // Replaces the old MLKit-returning detectFaces(). Callers that used
+  // Face.boundingBox now use the Rect directly.
+
+  Future<List<Rect>> detectFaces(Uint8List jpegBytes) async {
+    await init();
+    final faces = await _detectScrfd(jpegBytes);
+    final rects = faces.map((f) => f.box).toList();
+    appLog('[detectFaces] SCRFD returned ${rects.length} face(s)');
+    for (int i = 0; i < rects.length; i++) {
+      appLog('[detectFaces] Face[$i]: '
+          'left=${rects[i].left.toInt()} top=${rects[i].top.toInt()} '
+          'w=${rects[i].width.toInt()} h=${rects[i].height.toInt()}');
+    }
+    return rects;
+  }
+
+  // ── 5-point similarity transform warp ────────────────────
+  //
+  // Computes the least-squares similarity transform (scale + rotation + translation,
+  // no shear) that maps src landmarks onto the ArcFace 112×112 template,
+  // then warps the decoded image to produce a canonical 112×112 face crop.
+  //
+  // Math: closed-form Umeyama similarity transform (2D, 4 DOF).
+  img.Image _warpAffine5Point(img.Image src, List<Offset> srcKps) {
+    // Build mean-centred coordinates for src and dst
+    double srcMx = 0, srcMy = 0, dstMx = 0, dstMy = 0;
+    for (int k = 0; k < 5; k++) {
+      srcMx += srcKps[k].dx;
+      srcMy += srcKps[k].dy;
+      dstMx += _arcfaceTemplate[k].dx;
+      dstMy += _arcfaceTemplate[k].dy;
+    }
+    srcMx /= 5; srcMy /= 5;
+    dstMx /= 5; dstMy /= 5;
+
+    // Variance of src
+    double srcVar = 0;
+    for (int k = 0; k < 5; k++) {
+      final dx = srcKps[k].dx - srcMx;
+      final dy = srcKps[k].dy - srcMy;
+      srcVar += dx * dx + dy * dy;
+    }
+    srcVar /= 5;
+
+    // Cross-covariance matrix entries
+    double a = 0, b = 0;
+    for (int k = 0; k < 5; k++) {
+      final sx = srcKps[k].dx - srcMx;
+      final sy = srcKps[k].dy - srcMy;
+      final dx = _arcfaceTemplate[k].dx - dstMx;
+      final dy = _arcfaceTemplate[k].dy - dstMy;
+      a += sx * dx + sy * dy;
+      b += sx * dy - sy * dx;
+    }
+
+    if (srcVar < 1e-6) {
+      appLog('[Warp] srcVar too small — falling back to bbox crop');
+      return src; // caller will fall back to bbox path
+    }
+
+    final scale = (a * a + b * b > 0) ? sqrt(a * a + b * b) / (5 * srcVar) : 1.0;
+    final cosA  = srcVar > 0 ? a / (5 * srcVar * scale) : 1.0;
+    final sinA  = srcVar > 0 ? b / (5 * srcVar * scale) : 0.0;
+
+    // Affine matrix [2×3]:
+    //   | scale*cosA  -scale*sinA  tx |
+    //   | scale*sinA   scale*cosA  ty |
+    final sc = scale * cosA;
+    final ss = scale * sinA;
+    final tx = dstMx - sc * srcMx + ss * srcMy;
+    final ty = dstMy - ss * srcMx - sc * srcMy;
+
+    appLog('[Warp] scale=${scale.toStringAsFixed(3)} '
+        'cos=${cosA.toStringAsFixed(3)} sin=${sinA.toStringAsFixed(3)} '
+        'tx=${tx.toStringAsFixed(1)} ty=${ty.toStringAsFixed(1)}');
+
+    // Inverse transform: dst→src (for inverse-mapping the warp)
+    // [sc  -ss; ss  sc] inverse = [sc  ss; -ss  sc] / (sc²+ss²)
+    final det = sc * sc + ss * ss;
+    if (det < 1e-10) {
+      appLog('[Warp] det too small — falling back to bbox crop');
+      return src;
+    }
+    final icosA =  sc / det;
+    final isinA = -ss / det;
+    final itx   = -(icosA * tx - isinA * ty);
+    final ity   = -(isinA * tx + icosA * ty);
+
+    final out = img.Image(width: 112, height: 112);
+    for (int dy = 0; dy < 112; dy++) {
+      for (int dx = 0; dx < 112; dx++) {
+        // Map output pixel back to source
+        final sx = icosA * dx - isinA * dy + itx;
+        final sy = isinA * dx + icosA * dy + ity;
+
+        final ix = sx.round().clamp(0, src.width  - 1);
+        final iy = sy.round().clamp(0, src.height - 1);
+        out.setPixel(dx, dy, src.getPixel(ix, iy));
+      }
+    }
+    return out;
+  }
+
+  // ── Embedding ─────────────────────────────────────────────
+  // When landmarks are provided: runs 5-point alignment warp before embedding.
+  // Falls back to padded bbox crop when landmarks are absent.
+
+  Future<Float32List?> embed(Uint8List jpegBytes, Rect faceBox,
+      {List<Offset>? landmarks}) async {
+    appLog('[embed] Called — ${jpegBytes.length} bytes '
+        'landmarks=${landmarks != null ? landmarks.length : "none"}');
+
+    if (_inferencing) {
+      appLog('[embed] BLOCKED — _inferencing=true');
+      return null;
+    }
+
+    // _inferencing is set INSIDE the try so that every exit path — including
+    // early returns for null session — is guaranteed to hit the finally block
+    // and clear the flag. Previously it was set before try, meaning the
+    // session-null early return at lines ~542-546 escaped without clearing it,
+    // permanently locking out future embed calls until app restart.
+    try {
+      _inferencing = true;
+
+      final session   = _embSession;
+      final inputName = _embInputName;
+      if (session == null || inputName == null) {
+        appLog('[embed] FAIL — session null');
+        return null;
+      }
+
+      final rawDecoded = img.decodeImage(jpegBytes);
+      if (rawDecoded == null) {
+        appLog('[embed] FAIL — decodeImage null');
+        return null;
+      }
+      final decoded = img.bakeOrientation(rawDecoded);
+      appLog('[embed] decoded: ${decoded.width}x${decoded.height}');
+
+      img.Image resized;
+
+      if (landmarks != null && landmarks.length == 5) {
+        // ── 5-point aligned warp path ──────────────────────
+        appLog('[embed] using 5-point alignment');
+        final warped = _warpAffine5Point(decoded, landmarks);
+        if (warped.width == 112 && warped.height == 112) {
+          resized = warped;
+          appLog('[embed] warp OK — 112×112');
+        } else {
+          // _warpAffine5Point returned src (fallback signal)
+          appLog('[embed] warp returned src — falling back to bbox crop');
+          resized = _bboxCrop(decoded, faceBox);
+        }
+      } else {
+        // ── Legacy padded bbox crop path ───────────────────
+        appLog('[embed] using bbox crop (no landmarks)');
+        resized = _bboxCrop(decoded, faceBox);
+      }
+
+      if (resized == null) {
+        appLog('[embed] FAIL — resized null');
+        return null;
+      }
+
+      // ── Save crop for debugging ───────────────────────────
+      try {
+        final dir = Directory('/storage/emulated/0/VantageX');
+        if (!dir.existsSync()) dir.createSync(recursive: true);
+        final ts   = DateTime.now().millisecondsSinceEpoch;
+        final path = '${dir.path}/crop_$ts.jpg';
+        File(path).writeAsBytesSync(img.encodeJpg(resized, quality: 95));
+        appLog('[embed] Crop saved → $path');
+      } catch (e) {
+        appLog('[embed] Crop save failed (non-fatal): $e');
+      }
+      // ─────────────────────────────────────────────────────
+
+      final inputData = Float32List(1 * 3 * 112 * 112);
+      for (int py = 0; py < 112; py++) {
+        for (int px = 0; px < 112; px++) {
+          final p      = resized.getPixel(px, py);
+          final offset = py * 112 + px;
+          // BGR order for ArcFace
+          inputData[0 * 112 * 112 + offset] = (p.b.toDouble() - 127.5) / 128.0;
+          inputData[1 * 112 * 112 + offset] = (p.g.toDouble() - 127.5) / 128.0;
+          inputData[2 * 112 * 112 + offset] = (p.r.toDouble() - 127.5) / 128.0;
+        }
+      }
+
+      final inputTensor = OrtValueTensor.createTensorWithDataList(inputData, [1, 3, 112, 112]);
+      final outputs = await session.runAsync(OrtRunOptions(), {inputName: inputTensor});
+      inputTensor.release();
+
+      final rawOutput = outputs?[0]?.value;
+      if (rawOutput == null) {
+        appLog('[embed] FAIL — ONNX output null');
+        outputs?.forEach((e) => e?.release());
+        return null;
+      }
+
+      final List<double> rawList;
+      if (rawOutput is List) {
+        final inner = rawOutput[0];
+        if (inner is List) {
+          rawList = inner.map<double>((e) => (e as num).toDouble()).toList();
+        } else {
+          appLog('[embed] FAIL — unexpected inner type: ${inner.runtimeType}');
+          outputs?.forEach((e) => e?.release());
+          return null;
+        }
+      } else {
+        appLog('[embed] FAIL — unexpected output type: ${rawOutput.runtimeType}');
+        outputs?.forEach((e) => e?.release());
+        return null;
+      }
+      outputs?.forEach((e) => e?.release());
+
+      appLog('[embed] raw output length=${rawList.length}');
+      if (rawList.length != _outputSize) {
+        appLog('[embed] WARNING — expected $_outputSize dims, got ${rawList.length}');
+      }
+
+      final emb = _normalize(Float32List.fromList(rawList));
+      appLog('[embed] embedding done ✅ size=${emb.length}');
+      return emb;
+    } finally {
+      _inferencing = false;
+    }
+  }
+
+  /// Padded bbox crop + resize to 112×112. Used as fallback when no landmarks.
+  img.Image _bboxCrop(img.Image decoded, Rect faceBox) {
+    final padX = (faceBox.width  * 0.25).toInt();
+    final padY = (faceBox.height * 0.25).toInt();
+    final x = (faceBox.left.toInt() - padX).clamp(0, decoded.width  - 1);
+    final y = (faceBox.top.toInt()  - padY).clamp(0, decoded.height - 1);
+    final w = (faceBox.width.toInt()  + padX * 2).clamp(1, decoded.width  - x);
+    final h = (faceBox.height.toInt() + padY * 2).clamp(1, decoded.height - y);
+    appLog('[embed] Crop: x=$x y=$y w=$w h=$h (pad=25%)');
+    final cropped = img.copyCrop(decoded, x: x, y: y, width: w, height: h);
+    return img.copyResize(cropped,
+        width: 112, height: 112, interpolation: img.Interpolation.linear);
+  }
+
+  // ── Enrollment ────────────────────────────────────────────
+
+  Future<List<Float32List>> embeddingListFromPhotos(List<Uint8List> photos) async {
+    appLog('[embeddingList] Called with ${photos.length} photo(s)');
+    await init();
+
+    if (_embSession == null) {
+      throw Exception('ONNX model failed to load. Check assets/models/w600k_mbf.onnx');
+    }
+
+    final embeddings = <Float32List>[];
+
+    for (int i = 0; i < photos.length; i++) {
+      appLog('[embeddingList] ── Photo ${i + 1}/${photos.length} ──');
+
+      final rawDecoded = img.decodeImage(photos[i]);
+      if (rawDecoded == null) {
+        appLog('[embeddingList] Photo ${i + 1}: FAIL — decodeImage null');
+        continue;
+      }
+
+      final decoded   = img.bakeOrientation(rawDecoded);
+      final jpegBytes = Uint8List.fromList(img.encodeJpg(decoded, quality: 95));
+
+      List<_ScrfdFace> scrfdFaces;
+      try {
+        scrfdFaces = await _detectScrfd(jpegBytes);
+      } catch (e) {
+        appLog('[embeddingList] Photo ${i + 1}: FAIL — _detectScrfd threw: $e');
+        continue;
+      }
+
+      if (scrfdFaces.isEmpty) {
+        appLog('[embeddingList] Photo ${i + 1}: FAIL — no face detected');
+        continue;
+      }
+
+      // Pick largest face
+      final scrfdFace = scrfdFaces.reduce((a, b) =>
+          (a.box.width * a.box.height) > (b.box.width * b.box.height) ? a : b);
+
+      appLog('[embeddingList] Photo ${i + 1}: face — '
+          'left=${scrfdFace.box.left.toInt()} top=${scrfdFace.box.top.toInt()} '
+          'w=${scrfdFace.box.width.toInt()} h=${scrfdFace.box.height.toInt()} '
+          'kps=${scrfdFace.kps.length}');
+
+      final kps = scrfdFace.kps.length == 5 ? scrfdFace.kps : null;
+      final emb = await embed(jpegBytes, scrfdFace.box, landmarks: kps);
+      if (emb != null) {
+        embeddings.add(emb);
+        appLog('[embeddingList] Photo ${i + 1}: embed ✅ size=${emb.length}');
+      } else {
+        appLog('[embeddingList] Photo ${i + 1}: FAIL — embed returned null');
+      }
+    }
+
+    appLog('[embeddingList] done — ${embeddings.length}/${photos.length} succeeded');
+    return embeddings;
+  }
+
+  static Float32List packEmbeddings(List<Float32List> list) {
+    if (list.isEmpty) return Float32List(0);
+    final size   = list[0].length;
+    final packed = Float32List(size * list.length);
+    for (int i = 0; i < list.length; i++) {
+      packed.setRange(i * size, (i + 1) * size, list[i]);
+    }
+    return packed;
+  }
+
+  static List<Float32List> unpackEmbeddings(Float32List packed, int count) {
+    if (packed.isEmpty) return [];
+    if (packed.length == _outputSize) {
+      appLog('[unpack] single embedding (ignoring sampleCount=$count)');
+      return [packed];
+    }
+    if (count <= 0) return [packed];
+    final size = packed.length ~/ count;
+    if (size == 0) {
+      appLog('[unpack] WARNING — size=0, count=$count, packed.length=${packed.length}');
+      return [packed];
+    }
+    return List.generate(count,
+        (i) => Float32List.sublistView(packed, i * size, (i + 1) * size));
+  }
+
+  Future<Float32List?> embeddingFromPhotos(List<Uint8List> photos) async {
+    final list = await embeddingListFromPhotos(photos);
+    if (list.isEmpty) return null;
+    return list.length == 1 ? list[0] : _normalize(_average(list));
+  }
+
+  // ── Recognition with bounding box ────────────────────────
+
+  Future<FaceDetectionResult> matchFaceWithBox(
+    Uint8List jpegBytes,
+    List<Student> students,
+    int imageWidth,
+    int imageHeight,
+  ) async {
+    await init();
+
+    List<_ScrfdFace> scrfdFaces;
+    try {
+      scrfdFaces = await _detectScrfd(jpegBytes);
+    } catch (e) {
+      appLog('[Recog] _detectScrfd error: $e');
+      return FaceDetectionResult(matches: []);
+    }
+
+    if (scrfdFaces.isEmpty) return FaceDetectionResult(matches: []);
+
+    // Pick largest face
+    final scrfdFace = scrfdFaces.reduce((a, b) =>
+        (a.box.width * a.box.height) > (b.box.width * b.box.height) ? a : b);
+
+    // SCRFD coords are in baked-decoded-image space, not raw sensor space.
+    // Decode here to get the true dimensions that detection ran against.
+    final normRaw = img.decodeImage(jpegBytes);
+    final double normW;
+    final double normH;
+    if (normRaw != null) {
+      final normBaked = img.bakeOrientation(normRaw);
+      normW = normBaked.width.toDouble();
+      normH = normBaked.height.toDouble();
+    } else {
+      normW = imageWidth.toDouble();
+      normH = imageHeight.toDouble();
+    }
+    appLog('[Recog] normBox dims: ${normW.toInt()}x${normH.toInt()} '
+        '(sensor: ${imageWidth}x${imageHeight})');
+
+    final face    = scrfdFace.box;
+    final normBox = Rect.fromLTWH(
+      face.left   / normW,
+      face.top    / normH,
+      face.width  / normW,
+      face.height / normH,
+    );
+
+    // Normalize landmarks to [0..1]
+    List<Offset>? normLandmarks;
+    if (scrfdFace.kps.length == 5) {
+      normLandmarks = scrfdFace.kps.map((p) =>
+          Offset(p.dx / normW, p.dy / normH)).toList();
+      appLog('[Recog] landmarks normalized: '
+          '${normLandmarks.map((o) => '(${o.dx.toStringAsFixed(3)},${o.dy.toStringAsFixed(3)})').join(' ')}');
+    } else {
+      appLog('[Recog] no landmarks from SCRFD — embedding will use bbox crop');
+    }
+
+    if (students.isEmpty) {
+      appLog('[Recog] Face detected, no students enrolled');
+      return FaceDetectionResult(
+        matches: [],
+        faceBox: normBox,
+        faceWidthRatio: face.width / normW,
+        bakedImageSize: Size(normW, normH),
+        landmarks: normLandmarks,
+      );
+    }
+
+    // Pass pixel-space landmarks to embed
+    final kps = scrfdFace.kps.length == 5 ? scrfdFace.kps : null;
+    final queryEmb = await embed(jpegBytes, face, landmarks: kps);
+    if (queryEmb == null) {
+      appLog('[Recog] Embedding failed');
+      return FaceDetectionResult(
+          matches: [], faceBox: normBox,
+          bakedImageSize: Size(normW, normH),
+          landmarks: normLandmarks);
+    }
+    appLog('[Recog] Query embedding OK — comparing against ${students.length} student(s)...');
+
+    final results = <MatchResult>[];
+    for (final s in students) {
+      if (s.embedding.isEmpty) {
+        results.add(MatchResult(name: s.name, confidence: 0, similarity: 0));
+        continue;
+      }
+
+      final stored = unpackEmbeddings(s.embedding, s.sampleCount);
+      double bestSim = 0;
+      for (final storedEmb in stored) {
+        if (storedEmb.length != queryEmb.length) {
+          appLog('[Recog] WARNING — "${s.name}" dim mismatch: '
+              'stored=${storedEmb.length} query=${queryEmb.length} — skip slot');
+          continue;
+        }
+        final sim = _cosine(queryEmb, storedEmb);
+        if (sim > bestSim) bestSim = sim;
+      }
+
+      final conf = ((bestSim - _matchThreshold) / (1.0 - _matchThreshold))
+          .clamp(0.0, 1.0);
+      appLog('[Recog] "${s.name}": bestSim=${(bestSim * 100).toStringAsFixed(1)}% '
+          'conf=${(conf * 100).toStringAsFixed(1)}% (${stored.length} stored emb)');
+
+      results.add(MatchResult(name: s.name, confidence: conf, similarity: bestSim));
+    }
+    results.sort((a, b) => b.similarity.compareTo(a.similarity));
+
+    final best = results.first;
+    if (best.similarity >= _matchThreshold) {
+      appLog('[Recog] MATCH: ${best.name} sim=${best.similarityPercent} ✅');
+    } else {
+      appLog('[Recog] No match. Best: ${best.name} at ${best.similarityPercent}');
+    }
+
+    return FaceDetectionResult(
+      matches:        results,
+      faceBox:        normBox,
+      faceEulerY:     null, // SCRFD doesn't provide head pose
+      faceEulerX:     null,
+      faceWidthRatio: face.width / normW,
+      bakedImageSize: Size(normW, normH),
+      landmarks:      normLandmarks,
+    );
+  }
+
+  Future<List<MatchResult>> matchFace(
+      Uint8List jpegBytes, List<Student> students) async {
+    final result = await matchFaceWithBox(jpegBytes, students, 1, 1);
+    return result.matches;
+  }
+
+  // ── Math helpers ──────────────────────────────────────────
+
+  Float32List _normalize(Float32List e) {
+    double norm = 0;
+    for (final v in e) norm += v * v;
+    norm = sqrt(norm);
+    if (norm == 0) {
+      appLog('[normalize] WARNING — norm is 0, returning as-is');
+      return e;
+    }
+    final out = Float32List(e.length);
+    for (int i = 0; i < e.length; i++) out[i] = e[i] / norm;
+    return out;
+  }
+
+  double _cosine(Float32List a, Float32List b) {
+    double dot = 0, na = 0, nb = 0;
+    for (int i = 0; i < a.length; i++) {
+      dot += a[i] * b[i];
+      na  += a[i] * a[i];
+      nb  += b[i] * b[i];
+    }
+    if (na == 0 || nb == 0) return 0;
+    return dot / (sqrt(na) * sqrt(nb));
+  }
+
+  Float32List _average(List<Float32List> list) {
+    final len = list[0].length;
+    final avg = Float32List(len);
+    for (final e in list) { for (int i = 0; i < len; i++) avg[i] += e[i]; }
+    for (int i = 0; i < len; i++) avg[i] /= list.length;
+    return avg;
+  }
+
+  void dispose() {
+    appLog('[FaceService] dispose() called');
+    _detSession?.release();
+    _embSession?.release();
+    OrtEnv.instance.release();
+    _ready = false;
+    appLog('[FaceService] disposed ✅');
+  }
+}

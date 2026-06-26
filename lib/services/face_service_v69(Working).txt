@@ -1,0 +1,488 @@
+// lib/services/face_service.dart
+import 'dart:io';
+import 'dart:ui';
+import 'dart:math';
+import 'dart:typed_data';
+import 'package:google_mlkit_face_detection/google_mlkit_face_detection.dart';
+import 'package:image/image.dart' as img;
+import 'package:onnxruntime/onnxruntime.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:flutter/services.dart';
+import 'app_log.dart';
+import '../models/student.dart';
+
+class MatchResult {
+  final String name;
+  final double confidence;
+  final double similarity;
+
+  MatchResult({required this.name, required this.confidence, required this.similarity});
+
+  String get confidencePercent => '${(confidence * 100).toStringAsFixed(1)}%';
+  String get similarityPercent => '${(similarity * 100).toStringAsFixed(1)}%';
+}
+
+class FaceDetectionResult {
+  final List<MatchResult> matches;
+  final Rect? faceBox;
+  final double? faceEulerY;
+  final double? faceEulerX;
+  final double? faceWidthRatio;
+
+  FaceDetectionResult({
+    required this.matches,
+    this.faceBox,
+    this.faceEulerY,
+    this.faceEulerX,
+    this.faceWidthRatio,
+  });
+}
+
+class FaceService {
+  static final FaceService _i = FaceService._();
+  factory FaceService() => _i;
+  FaceService._();
+
+  FaceDetector?  _detector;
+  OrtSession?    _session;
+  bool           _initializing = false;
+  bool           _ready        = false;
+  bool           _inferencing  = false;
+
+  // w600k_mbf.onnx outputs 512-dim embeddings.
+  // ⚠️  If you have students enrolled with the old TFLite model (128-dim),
+  // their embeddings are incompatible — re-enroll them after migration.
+  static const int    _outputSize     = 512;
+  static const double _matchThreshold = 0.35;
+
+  // ── Init ──────────────────────────────────────────────────
+
+  Future<void> init() async {
+    if (_ready) {
+      appLog('[FaceService] init(): already ready — skipping');
+      return;
+    }
+    if (_initializing) {
+      appLog('[FaceService] init(): already initializing — waiting...');
+      while (_initializing) {
+        await Future.delayed(const Duration(milliseconds: 50));
+      }
+      appLog('[FaceService] init(): wait done, _ready=$_ready');
+      return;
+    }
+    _initializing = true;
+    appLog('[FaceService] init(): starting');
+    try {
+      appLog('[FaceService] Creating MLKit FaceDetector (accurate, minFaceSize=0.05)...');
+      _detector = FaceDetector(
+        options: FaceDetectorOptions(
+          performanceMode: FaceDetectorMode.accurate,
+          enableLandmarks: false,
+          minFaceSize: 0.05,
+        ),
+      );
+      appLog('[FaceService] FaceDetector created ✅');
+
+      appLog('[FaceService] Initializing OrtEnv...');
+      OrtEnv.instance.init();
+      appLog('[FaceService] OrtEnv initialized ✅');
+
+      appLog('[FaceService] Loading ONNX model: assets/models/w600k_mbf.onnx...');
+      final rawAsset = await rootBundle.load('assets/models/w600k_mbf.onnx');
+      final modelBytes = rawAsset.buffer.asUint8List();
+      appLog('[FaceService] Model bytes loaded: ${modelBytes.length} bytes');
+
+      final sessionOptions = OrtSessionOptions()
+        ..setInterOpNumThreads(2)
+        ..setIntraOpNumThreads(2);
+      _session = OrtSession.fromBuffer(modelBytes, sessionOptions);
+      appLog('[FaceService] OrtSession created ✅');
+
+      _ready = true;
+      appLog('[FaceService] Initialization complete ✅  outputSize=$_outputSize');
+    } catch (e, st) {
+      appLog('[FaceService] FAIL — init threw: $e');
+      appLog('[FaceService] Stack: ${st.toString().split('\n').take(4).join(' | ')}');
+    } finally {
+      _initializing = false;
+      appLog('[FaceService] _initializing reset to false');
+    }
+  }
+
+  bool get tfliteLoaded => _session != null; // renamed internally; callers unchanged
+  double get matchThreshold => _matchThreshold;
+
+  // ── Face detection ────────────────────────────────────────
+  // Unchanged — still MLKit
+
+  Future<List<Face>> detectFaces(Uint8List jpegBytes) async {
+    appLog('[detectFaces] Called with ${jpegBytes.length} bytes');
+    await init();
+
+    if (_detector == null) {
+      appLog('[detectFaces] FAIL — detector is null after init');
+      return [];
+    }
+    appLog('[detectFaces] Detector ready ✅');
+
+    appLog('[detectFaces] Getting temp directory...');
+    final tempDir  = await getTemporaryDirectory();
+    final tempPath = '${tempDir.path}/det_${DateTime.now().millisecondsSinceEpoch}.jpg';
+    appLog('[detectFaces] Writing ${jpegBytes.length} bytes to: $tempPath');
+    final tempFile = File(tempPath);
+    await tempFile.writeAsBytes(jpegBytes);
+    appLog('[detectFaces] Temp file written ✅');
+
+    try {
+      appLog('[detectFaces] Calling MLKit processImage()...');
+      final faces = await _detector!.processImage(InputImage.fromFilePath(tempPath));
+      appLog('[detectFaces] MLKit returned ${faces.length} face(s) ✅');
+      for (int i = 0; i < faces.length; i++) {
+        final bb = faces[i].boundingBox;
+        appLog('[detectFaces] Face[$i]: left=${bb.left.toInt()} top=${bb.top.toInt()} w=${bb.width.toInt()} h=${bb.height.toInt()}');
+      }
+      return faces;
+    } catch (e, st) {
+      appLog('[detectFaces] FAIL — MLKit threw: $e');
+      appLog('[detectFaces] Stack: ${st.toString().split('\n').take(3).join(' | ')}');
+      return [];
+    } finally {
+      try {
+        await tempFile.delete();
+        appLog('[detectFaces] Temp file deleted ✅');
+      } catch (e) {
+        appLog('[detectFaces] WARNING — could not delete temp file: $e');
+      }
+    }
+  }
+
+  // ── Embedding ─────────────────────────────────────────────
+  // CHANGED: now async (ONNX run is async).
+  // CHANGED: NCHW layout [1,3,112,112], BGR channel order, /128.0 normalization.
+  // REMOVED: batch-2 workaround (not needed for ONNX).
+
+  Future<Float32List?> embed(Uint8List jpegBytes, Face face) async {
+    appLog('[embed] Called — ${jpegBytes.length} bytes');
+
+    if (_inferencing) {
+      appLog('[embed] BLOCKED — _inferencing=true (concurrent call guard)');
+      return null;
+    }
+    _inferencing = true;
+    appLog('[embed] _inferencing set to true');
+
+    final session = _session;
+    if (session == null) {
+      appLog('[embed] FAIL — session is null');
+      _inferencing = false;
+      return null;
+    }
+    appLog('[embed] Session reference obtained ✅');
+
+    try {
+      appLog('[embed] Calling img.decodeImage()...');
+      final rawDecoded = img.decodeImage(jpegBytes);
+      if (rawDecoded == null) {
+        appLog('[embed] FAIL — img.decodeImage() returned null');
+        return null;
+      }
+      appLog('[embed] Image decoded ✅ — ${rawDecoded.width}x${rawDecoded.height}');
+
+      final decoded = img.bakeOrientation(rawDecoded);
+      appLog('[embed] bakeOrientation done: ${decoded.width}x${decoded.height}');
+
+      final padX = (face.boundingBox.width  * 0.2).toInt();
+      final padY = (face.boundingBox.height * 0.2).toInt();
+
+      final x = (face.boundingBox.left.toInt() - padX).clamp(0, decoded.width  - 1);
+      final y = (face.boundingBox.top.toInt()  - padY).clamp(0, decoded.height - 1);
+      final w = (face.boundingBox.width.toInt()  + padX * 2).clamp(1, decoded.width  - x);
+      final h = (face.boundingBox.height.toInt() + padY * 2).clamp(1, decoded.height - y);
+      appLog('[embed] Crop region: x=$x y=$y w=$w h=$h');
+
+      if (w < 20 || h < 20) {
+        appLog('[embed] FAIL — crop too small: ${w}x$h');
+        return null;
+      }
+
+      final cropped = img.copyCrop(decoded, x: x, y: y, width: w, height: h);
+      final resized = img.copyResize(cropped,
+          width: 112, height: 112, interpolation: img.Interpolation.linear);
+      appLog('[embed] Crop+resize done ✅ — 112x112');
+
+      // Build NCHW float32 tensor [1, 3, 112, 112]
+      // w600k_mbf expects BGR channel order, normalized (pixel - 127.5) / 128.0
+      appLog('[embed] Building NCHW input tensor [1,3,112,112] BGR...');
+      final inputData = Float32List(1 * 3 * 112 * 112);
+      for (int py = 0; py < 112; py++) {
+        for (int px = 0; px < 112; px++) {
+          final p = resized.getPixel(px, py);
+          final offset = py * 112 + px;
+          // Channel 0 = B, 1 = G, 2 = R  (BGR order)
+          inputData[0 * 112 * 112 + offset] = (p.b.toDouble() - 127.5) / 128.0;
+          inputData[1 * 112 * 112 + offset] = (p.g.toDouble() - 127.5) / 128.0;
+          inputData[2 * 112 * 112 + offset] = (p.r.toDouble() - 127.5) / 128.0;
+        }
+      }
+      appLog('[embed] Input tensor built ✅');
+
+      final inputTensor = OrtValueTensor.createTensorWithDataList(
+        inputData,
+        [1, 3, 112, 112],
+      );
+
+      final inputs = {'input.1': inputTensor};
+      appLog('[embed] Running ONNX inference...');
+      final outputs = await session.runAsync(OrtRunOptions(), inputs);
+      inputTensor.release();
+      appLog('[embed] ONNX inference done ✅');
+
+      final rawOutput = outputs?[0]?.value;
+      if (rawOutput == null) {
+        appLog('[embed] FAIL — ONNX output is null');
+        outputs?.forEach((e) => e?.release());
+        return null;
+      }
+
+      // Output shape: [1, 512] — extract the flat list
+      final List<double> rawList;
+      if (rawOutput is List) {
+        // [[v0, v1, ... v511]]
+        final inner = rawOutput[0];
+        if (inner is List) {
+          rawList = inner.map<double>((e) => (e as num).toDouble()).toList();
+        } else {
+          appLog('[embed] FAIL — unexpected output inner type: ${inner.runtimeType}');
+          outputs?.forEach((e) => e?.release());
+          return null;
+        }
+      } else {
+        appLog('[embed] FAIL — unexpected output type: ${rawOutput.runtimeType}');
+        outputs?.forEach((e) => e?.release());
+        return null;
+      }
+
+      outputs?.forEach((e) => e?.release());
+
+      appLog('[embed] Raw output length: ${rawList.length}');
+      final rawFloat = Float32List.fromList(rawList);
+      final emb = _normalize(rawFloat);
+      appLog('[embed] Normalized embedding done ✅ size=${emb.length}');
+      return emb;
+    } finally {
+      _inferencing = false;
+      appLog('[embed] _inferencing reset to false');
+    }
+  }
+
+  // ── Enrollment ────────────────────────────────────────────
+  // Only change: embed() is now awaited (was sync before).
+
+  Future<Float32List?> embeddingFromPhotos(List<Uint8List> photos) async {
+    appLog('[embeddingFromPhotos] Called with ${photos.length} photo(s)');
+
+    appLog('[embeddingFromPhotos] Calling init()...');
+    await init();
+
+    if (_session == null) {
+      appLog('[embeddingFromPhotos] FAIL — session null after init');
+      throw Exception('ONNX model failed to load. Check assets/models/w600k_mbf.onnx');
+    }
+    appLog('[embeddingFromPhotos] Session ready ✅');
+
+    final embeddings = <Float32List>[];
+
+    for (int i = 0; i < photos.length; i++) {
+      appLog('[embeddingFromPhotos] ── Photo ${i + 1}/${photos.length} ──');
+      appLog('[embeddingFromPhotos] Photo ${i + 1}: raw bytes=${photos[i].length}');
+
+      final rawDecoded = img.decodeImage(photos[i]);
+      if (rawDecoded == null) {
+        appLog('[embeddingFromPhotos] Photo ${i + 1}: FAIL — decodeImage() null');
+        continue;
+      }
+      appLog('[embeddingFromPhotos] Photo ${i + 1}: decoded ✅ — ${rawDecoded.width}x${rawDecoded.height}');
+
+      final decoded = img.bakeOrientation(rawDecoded);
+      appLog('[embeddingFromPhotos] Photo ${i + 1}: bakeOrientation done: '
+          '${decoded.width}x${decoded.height} (raw was ${rawDecoded.width}x${rawDecoded.height})');
+
+      final jpegBytes = Uint8List.fromList(img.encodeJpg(decoded, quality: 95));
+      appLog('[embeddingFromPhotos] Photo ${i + 1}: re-encode done ✅ — ${jpegBytes.length} bytes');
+
+      List<Face> faces;
+      try {
+        faces = await detectFaces(jpegBytes);
+      } catch (e) {
+        appLog('[embeddingFromPhotos] Photo ${i + 1}: FAIL — detectFaces threw: $e');
+        continue;
+      }
+      appLog('[embeddingFromPhotos] Photo ${i + 1}: detectFaces() returned ${faces.length} face(s)');
+
+      if (faces.isEmpty) {
+        appLog('[embeddingFromPhotos] Photo ${i + 1}: FAIL — no face in saved photo');
+        continue;
+      }
+
+      final face = faces.reduce((a, b) =>
+          (a.boundingBox.width * a.boundingBox.height) >
+                  (b.boundingBox.width * b.boundingBox.height)
+              ? a : b);
+
+      final bb = face.boundingBox;
+      appLog('[embeddingFromPhotos] Photo ${i + 1}: largest face — '
+          'left=${bb.left.toInt()} top=${bb.top.toInt()} '
+          'w=${bb.width.toInt()} h=${bb.height.toInt()}');
+
+      final emb = await embed(jpegBytes, face); // ← now awaited
+      if (emb != null) {
+        embeddings.add(emb);
+        appLog('[embeddingFromPhotos] Photo ${i + 1}: embed() succeeded ✅ size=${emb.length}');
+      } else {
+        appLog('[embeddingFromPhotos] Photo ${i + 1}: FAIL — embed() returned null');
+      }
+    }
+
+    appLog('[embeddingFromPhotos] Loop done — ${embeddings.length}/${photos.length} succeeded');
+
+    if (embeddings.isEmpty) {
+      appLog('[embeddingFromPhotos] FAIL — no valid embeddings from any photo');
+      return null;
+    }
+
+    final result = embeddings.length == 1
+        ? embeddings[0]
+        : _normalize(_average(embeddings));
+    appLog('[embeddingFromPhotos] Final embedding ready ✅ size=${result.length}');
+    return result;
+  }
+
+  // ── Recognition with bounding box ────────────────────────
+  // Only change: embed() is now awaited.
+
+  Future<FaceDetectionResult> matchFaceWithBox(
+    Uint8List jpegBytes,
+    List<Student> students,
+    int imageWidth,
+    int imageHeight,
+  ) async {
+    await init();
+
+    List<Face> faces;
+    try {
+      faces = await detectFaces(jpegBytes);
+    } catch (e) {
+      appLog('[Recog] detectFaces error: $e');
+      return FaceDetectionResult(matches: []);
+    }
+
+    if (faces.isEmpty) {
+      return FaceDetectionResult(matches: []);
+    }
+
+    final face = faces.reduce((a, b) =>
+        (a.boundingBox.width * a.boundingBox.height) >
+                (b.boundingBox.width * b.boundingBox.height)
+            ? a : b);
+
+    final normBox = Rect.fromLTWH(
+      face.boundingBox.left   / imageWidth,
+      face.boundingBox.top    / imageHeight,
+      face.boundingBox.width  / imageWidth,
+      face.boundingBox.height / imageHeight,
+    );
+
+    if (students.isEmpty) {
+      appLog('[Recog] Face detected, no students enrolled');
+      return FaceDetectionResult(matches: [], faceBox: normBox);
+    }
+
+    appLog('[Recog] Generating query embedding...');
+    final queryEmb = await embed(jpegBytes, face); // ← now awaited
+    if (queryEmb == null) {
+      appLog('[Recog] Embedding failed for query face');
+      return FaceDetectionResult(matches: [], faceBox: normBox);
+    }
+    appLog('[Recog] Query embedding OK, comparing against ${students.length} student(s)...');
+
+    final results = <MatchResult>[];
+    for (final s in students) {
+      // Dimension mismatch guard: old 128-dim embeddings vs new 512-dim
+      if (s.embedding.length != queryEmb.length) {
+        appLog('[Recog] WARNING — "${s.name}" embedding dim=${s.embedding.length} '
+            'vs query dim=${queryEmb.length} — re-enroll this student');
+        results.add(MatchResult(name: s.name, confidence: 0, similarity: 0));
+        continue;
+      }
+      final sim  = _cosine(queryEmb, s.embedding);
+      final conf = ((sim - _matchThreshold) / (1.0 - _matchThreshold)).clamp(0.0, 1.0);
+      appLog('[Recog] vs "${s.name}": sim=${(sim*100).toStringAsFixed(1)}% conf=${(conf*100).toStringAsFixed(1)}%');
+      results.add(MatchResult(name: s.name, confidence: conf, similarity: sim));
+    }
+    results.sort((a, b) => b.similarity.compareTo(a.similarity));
+
+    final best = results.first;
+    if (best.similarity >= _matchThreshold) {
+      appLog('[Recog] MATCH: ${best.name} sim=${best.similarityPercent} ✅');
+    } else {
+      appLog('[Recog] No match above threshold. Best: ${best.name} at ${best.similarityPercent}');
+    }
+
+    return FaceDetectionResult(
+    matches: results,
+    faceBox: normBox,
+    faceEulerY: face.headEulerAngleY,
+    faceEulerX: face.headEulerAngleX,
+    faceWidthRatio: face.boundingBox.width / imageWidth,
+    );
+  }
+
+  Future<List<MatchResult>> matchFace(
+      Uint8List jpegBytes, List<Student> students) async {
+    final result = await matchFaceWithBox(jpegBytes, students, 1, 1);
+    return result.matches;
+  }
+
+  // ── Math helpers — unchanged ──────────────────────────────
+
+  Float32List _normalize(Float32List e) {
+    double norm = 0;
+    for (final v in e) norm += v * v;
+    norm = sqrt(norm);
+    if (norm == 0) {
+      appLog('[normalize] WARNING — norm is 0, returning as-is');
+      return e;
+    }
+    final out = Float32List(e.length);
+    for (int i = 0; i < e.length; i++) out[i] = e[i] / norm;
+    return out;
+  }
+
+  double _cosine(Float32List a, Float32List b) {
+    double dot = 0, na = 0, nb = 0;
+    for (int i = 0; i < a.length; i++) {
+      dot += a[i] * b[i]; na += a[i] * a[i]; nb += b[i] * b[i];
+    }
+    if (na == 0 || nb == 0) return 0;
+    return dot / (sqrt(na) * sqrt(nb));
+  }
+
+  Float32List _average(List<Float32List> list) {
+    appLog('[average] Averaging ${list.length} embeddings of size ${list[0].length}');
+    final len = list[0].length;
+    final avg = Float32List(len);
+    for (final e in list) { for (int i = 0; i < len; i++) avg[i] += e[i]; }
+    for (int i = 0; i < len; i++) avg[i] /= list.length;
+    appLog('[average] Done ✅');
+    return avg;
+  }
+
+  void dispose() {
+    appLog('[FaceService] dispose() called');
+    _detector?.close();
+    _session?.release();
+    OrtEnv.instance.release();
+    _ready = false;
+    appLog('[FaceService] disposed ✅');
+  }
+}
