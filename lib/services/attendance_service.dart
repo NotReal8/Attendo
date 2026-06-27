@@ -63,7 +63,6 @@ class AttendanceService {
       final acctRef  = fs.collection('orgs').doc(orgId).collection('accounts').doc(acctName);
       final rollNoMap = await _db.getRollNoMap();
 
-      // Firestore batch limit is 500 — chunk if needed
       const chunkSize = 400;
       for (int start = 0; start < records.length; start += chunkSize) {
         final chunk = records.sublist(start,
@@ -86,7 +85,6 @@ class AttendanceService {
         await batch.commit();
       }
 
-      // Flat mirror for web dashboard querying
       for (int start = 0; start < records.length; start += chunkSize) {
         final chunk = records.sublist(start,
             (start + chunkSize).clamp(0, records.length));
@@ -116,43 +114,43 @@ class AttendanceService {
   }
 
   Future<void> syncStatusUpdate({
-  required String orgId,
-  required String date,
-  required String label,
-  required String studentName,
-  required String newStatus,
-  required String accountName,
-}) async {
-  try {
-    final fs      = FirebaseFirestore.instance;
-    final acctRef = fs.collection('orgs').doc(orgId)
-        .collection('accounts').doc(accountName);
+    required String orgId,
+    required String date,
+    required String label,
+    required String studentName,
+    required String newStatus,
+    required String accountName,
+  }) async {
+    try {
+      final fs      = FirebaseFirestore.instance;
+      final acctRef = fs.collection('orgs').doc(orgId)
+          .collection('accounts').doc(accountName);
 
-    await acctRef
-        .collection('attendance').doc(date)
-        .collection(label).doc(studentName)
-        .update({
-      'status':     newStatus,
-      'updated_at': FieldValue.serverTimestamp(),
-      'updated_by': accountName,
-    });
+      await acctRef
+          .collection('attendance').doc(date)
+          .collection(label).doc(studentName)
+          .update({
+        'status':     newStatus,
+        'updated_at': FieldValue.serverTimestamp(),
+        'updated_by': accountName,
+      });
 
-    final flatDocId = '${date}__${label}__${studentName}'
-        .replaceAll(' ', '_')
-        .replaceAll('·', '-');
-    await acctRef
-        .collection('attendance_flat').doc(flatDocId)
-        .update({
-      'status':     newStatus,
-      'updated_at': FieldValue.serverTimestamp(),
-      'updated_by': accountName,
-    });
+      final flatDocId = '${date}__${label}__${studentName}'
+          .replaceAll(' ', '_')
+          .replaceAll('·', '-');
+      await acctRef
+          .collection('attendance_flat').doc(flatDocId)
+          .update({
+        'status':     newStatus,
+        'updated_at': FieldValue.serverTimestamp(),
+        'updated_by': accountName,
+      });
 
-    appLog('[AttendanceService] Firestore status sync done ✅ $studentName→$newStatus');
-  } catch (e) {
-    appLog('[AttendanceService] Firestore status sync failed (non-fatal): $e');
+      appLog('[AttendanceService] Firestore status sync done ✅ $studentName→$newStatus');
+    } catch (e) {
+      appLog('[AttendanceService] Firestore status sync failed (non-fatal): $e');
+    }
   }
-}
 
   Future<List<String>> getSessionDates() async => _db.distinctDates();
 
@@ -169,10 +167,7 @@ class AttendanceService {
     await _db.deleteSession(date, label);
   }
 
-  // ── Excel export ──────────────────────────────────────────
-  //
-  // [selectedSessions] is a list of (date, label) pairs chosen by the user.
-  // One sheet per session. Header block at top of each sheet.
+  // ── Excel export — by session ─────────────────────────────
 
   Future<File> exportToExcel(
     List<({String date, String label})> selectedSessions,
@@ -181,18 +176,15 @@ class AttendanceService {
     final orgName = prefs.getString('org_id')       ?? 'Institution';
     final acctName= prefs.getString('account_name') ?? '';
 
-    // Roll number lookup
     final rollNoMap = await _db.getRollNoMap();
 
     final excel = Excel.createExcel();
-    // Remove default Sheet1
     excel.delete('Sheet1');
 
     for (final session in selectedSessions) {
       final records = await _db.recordsForDateAndLabel(session.date, session.label);
       if (records.isEmpty) continue;
 
-      // Sheet name: sanitise label for Excel (max 31 chars, no special chars)
       final rawSheetName = '${session.date} ${session.label}'
           .replaceAll(RegExp(r'[:\\/?*\[\]]'), '-');
       final sheetName = rawSheetName.length > 31
@@ -209,7 +201,6 @@ class AttendanceService {
 
       final groupName = records.first.groupName;
 
-      // ── Helper: bold cell style ───────────────────────────
       CellStyle boldStyle() => CellStyle(
             bold: true,
             fontColorHex: ExcelColor.fromHexString('#FFFFFF'),
@@ -232,12 +223,10 @@ class AttendanceService {
             bold: true,
           );
 
-      // ── Header block (rows 0–6) ───────────────────────────
       void writeHeader(int row, String key, String value) {
         final keyCell = sheet.cell(CellIndex.indexByColumnRow(columnIndex: 0, rowIndex: row));
         keyCell.value = TextCellValue(key);
         keyCell.cellStyle = boldStyle();
-
         final valCell = sheet.cell(CellIndex.indexByColumnRow(columnIndex: 1, rowIndex: row));
         valCell.value = TextCellValue(value);
       }
@@ -252,10 +241,6 @@ class AttendanceService {
       writeHeader(7, 'Absent',         '$absent');
       writeHeader(8, 'Attendance %',   pct);
 
-      // Blank separator row
-      // (row 9 left empty)
-
-      // ── Column headers (row 10) ───────────────────────────
       final colHeaders = ['Date', 'Name', 'Roll No', 'Status'];
       for (int col = 0; col < colHeaders.length; col++) {
         final cell = sheet.cell(CellIndex.indexByColumnRow(columnIndex: col, rowIndex: 10));
@@ -263,7 +248,6 @@ class AttendanceService {
         cell.cellStyle = headerStyle();
       }
 
-      // ── Data rows (from row 11) ───────────────────────────
       final dateStr = DateFormat('dd-MM-yy').format(DateTime.parse(session.date));
       for (int i = 0; i < records.length; i++) {
         final r   = records[i];
@@ -271,10 +255,8 @@ class AttendanceService {
 
         sheet.cell(CellIndex.indexByColumnRow(columnIndex: 0, rowIndex: row)).value =
             TextCellValue(dateStr);
-
         sheet.cell(CellIndex.indexByColumnRow(columnIndex: 1, rowIndex: row)).value =
             TextCellValue(r.studentName);
-
         sheet.cell(CellIndex.indexByColumnRow(columnIndex: 2, rowIndex: row)).value =
             TextCellValue(rollNoMap[r.studentName] ?? '');
 
@@ -285,11 +267,10 @@ class AttendanceService {
             r.status == 'present' ? presentStyle() : absentStyle();
       }
 
-      // Column widths
-      sheet.setColumnWidth(0, 14); // Date
-      sheet.setColumnWidth(1, 28); // Name
-      sheet.setColumnWidth(2, 12); // Roll No
-      sheet.setColumnWidth(3, 12); // Status
+      sheet.setColumnWidth(0, 14);
+      sheet.setColumnWidth(1, 28);
+      sheet.setColumnWidth(2, 12);
+      sheet.setColumnWidth(3, 12);
     }
 
     if (excel.sheets.isEmpty) {
@@ -303,6 +284,125 @@ class AttendanceService {
     final file = File('${dir.path}/Attendance_Report.xlsx');
     await file.writeAsBytes(bytes, flush: true);
     appLog('[AttendanceService] Excel export done ✅ path=${file.path}');
+    return file;
+  }
+
+  // ── Excel export — by student ─────────────────────────────
+  //
+  // One sheet per student. Each sheet lists every session they appear in,
+  // with a summary header block matching the session-export style.
+
+  Future<File> exportStudentsToExcel(List<String> studentNames) async {
+    final prefs    = await SharedPreferences.getInstance();
+    final orgName  = prefs.getString('org_id')       ?? 'Institution';
+    final acctName = prefs.getString('account_name') ?? '';
+
+    final rollNoMap = await _db.getRollNoMap();
+
+    final excel = Excel.createExcel();
+    excel.delete('Sheet1');
+
+    for (final name in studentNames) {
+      final records = await _db.recordsForStudent(name);
+
+      // Sheet name: student name sanitised, max 31 chars
+      final rawSheet = name.replaceAll(RegExp(r'[:\\/?*\[\]]'), '-');
+      final sheetName = rawSheet.length > 31 ? rawSheet.substring(0, 31) : rawSheet;
+
+      final sheet = excel[sheetName];
+
+      final total   = records.length;
+      final present = records.where((r) => r.status == 'present').length;
+      final absent  = total - present;
+      final pct     = total == 0
+          ? '0%'
+          : '${(present / total * 100).toStringAsFixed(1)}%';
+
+      CellStyle boldStyle() => CellStyle(
+            bold: true,
+            fontColorHex: ExcelColor.fromHexString('#FFFFFF'),
+            backgroundColorHex: ExcelColor.fromHexString('#1E293B'),
+          );
+
+      CellStyle headerStyle() => CellStyle(
+            bold: true,
+            fontColorHex: ExcelColor.fromHexString('#FFFFFF'),
+            backgroundColorHex: ExcelColor.fromHexString('#2563EB'),
+          );
+
+      CellStyle presentStyle() => CellStyle(
+            fontColorHex: ExcelColor.fromHexString('#16A34A'),
+            bold: true,
+          );
+
+      CellStyle absentStyle() => CellStyle(
+            fontColorHex: ExcelColor.fromHexString('#DC2626'),
+            bold: true,
+          );
+
+      void writeHeader(int row, String key, String value) {
+        final keyCell = sheet.cell(CellIndex.indexByColumnRow(columnIndex: 0, rowIndex: row));
+        keyCell.value = TextCellValue(key);
+        keyCell.cellStyle = boldStyle();
+        final valCell = sheet.cell(CellIndex.indexByColumnRow(columnIndex: 1, rowIndex: row));
+        valCell.value = TextCellValue(value);
+      }
+
+      writeHeader(0, 'Institution',     orgName);
+      writeHeader(1, 'Account',         acctName);
+      writeHeader(2, 'Student',         name);
+      writeHeader(3, 'Roll No',         rollNoMap[name] ?? '');
+      writeHeader(4, 'Total Sessions',  '$total');
+      writeHeader(5, 'Present',         '$present');
+      writeHeader(6, 'Absent',          '$absent');
+      writeHeader(7, 'Attendance %',    pct);
+
+      // Column headers (row 9)
+      final colHeaders = ['Date', 'Session', 'Group', 'Status'];
+      for (int col = 0; col < colHeaders.length; col++) {
+        final cell = sheet.cell(CellIndex.indexByColumnRow(columnIndex: col, rowIndex: 9));
+        cell.value = TextCellValue(colHeaders[col]);
+        cell.cellStyle = headerStyle();
+      }
+
+      // Data rows from row 10
+      for (int i = 0; i < records.length; i++) {
+        final r   = records[i];
+        final row = 10 + i;
+
+        sheet.cell(CellIndex.indexByColumnRow(columnIndex: 0, rowIndex: row)).value =
+            TextCellValue(DateFormat('dd-MM-yy').format(DateTime.parse(r.sessionDate)));
+        sheet.cell(CellIndex.indexByColumnRow(columnIndex: 1, rowIndex: row)).value =
+            TextCellValue(r.sessionLabel);
+        sheet.cell(CellIndex.indexByColumnRow(columnIndex: 2, rowIndex: row)).value =
+            TextCellValue(r.groupName);
+
+        final statusCell = sheet.cell(
+            CellIndex.indexByColumnRow(columnIndex: 3, rowIndex: row));
+        statusCell.value = TextCellValue(r.status == 'present' ? 'Present' : 'Absent');
+        statusCell.cellStyle =
+            r.status == 'present' ? presentStyle() : absentStyle();
+      }
+
+      sheet.setColumnWidth(0, 14);
+      sheet.setColumnWidth(1, 24);
+      sheet.setColumnWidth(2, 20);
+      sheet.setColumnWidth(3, 12);
+
+      appLog('[AttendanceService] exportStudents: "$name" — $total record(s)');
+    }
+
+    if (excel.sheets.isEmpty) {
+      throw Exception('No attendance records found for selected students.');
+    }
+
+    final bytes = excel.save();
+    if (bytes == null) throw Exception('Failed to encode Excel file.');
+
+    final dir  = await getApplicationDocumentsDirectory();
+    final file = File('${dir.path}/Student_Attendance_Report.xlsx');
+    await file.writeAsBytes(bytes, flush: true);
+    appLog('[AttendanceService] Student Excel export done ✅ path=${file.path}');
     return file;
   }
 }

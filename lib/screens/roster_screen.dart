@@ -1,6 +1,7 @@
 // lib/screens/roster_screen.dart
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
+import 'package:share_plus/share_plus.dart';
 import '../app_colors.dart';
 import '../models/student.dart';
 import '../models/group.dart';
@@ -28,6 +29,10 @@ class _RosterScreenState extends State<RosterScreen> {
 
   final TextEditingController _searchCtrl = TextEditingController();
   String _query = '';
+
+  bool _selectMode = false;
+  final Set<String> _selectedStudents = {};
+  bool _exporting = false;
 
   @override
   void initState() {
@@ -82,27 +87,66 @@ class _RosterScreenState extends State<RosterScreen> {
     return colors[name.codeUnitAt(0) % colors.length];
   }
 
+  void _toggleSelectMode() {
+    setState(() {
+      _selectMode = !_selectMode;
+      if (!_selectMode) _selectedStudents.clear();
+    });
+  }
+
+  Future<void> _exportSelectedStudents() async {
+    if (_selectedStudents.isEmpty || _exporting) return;
+    setState(() => _exporting = true);
+    try {
+      final file = await _att.exportStudentsToExcel(_selectedStudents.toList());
+      await Share.shareXFiles([XFile(file.path)], subject: 'Student Attendance Report');
+    } catch (e) {
+      if (mounted) ScaffoldMessenger.of(context)
+          .showSnackBar(SnackBar(content: Text('Export failed: $e')));
+    } finally {
+      if (mounted) setState(() => _exporting = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: AppColors.background,
       appBar: AppBar(
         title: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          const Text('Roster'),
-          Text(_tab == 0 ? '${_students.length} students registered' : '${_groups.length} group(s)',
-              style: const TextStyle(fontSize: 12, color: AppColors.textSecondary, fontWeight: FontWeight.w400)),
+          Text(_selectMode ? '${_selectedStudents.length} selected' : 'Roster'),
+          if (!_selectMode)
+            Text(_tab == 0 ? '${_students.length} students registered' : '${_groups.length} group(s)',
+                style: const TextStyle(fontSize: 12, color: AppColors.textSecondary, fontWeight: FontWeight.w400)),
         ]),
-        actions: [
-          if (_tab == 0)
-            IconButton(icon: const Icon(Icons.person_add_outlined), tooltip: 'Register student',
-                onPressed: () => Navigator.push(context,
-                  MaterialPageRoute(builder: (_) => const RegisterStudentScreen())).then((_) => _load()))
-          else
-            IconButton(icon: const Icon(Icons.add_box_outlined), tooltip: 'Create group',
-                onPressed: () => Navigator.push(context,
-                  MaterialPageRoute(builder: (_) => const GroupFormScreen())).then((_) => _load())),
-          IconButton(icon: const Icon(Icons.refresh), onPressed: _load),
-        ],
+        actions: _tab != 0
+            ? [
+                IconButton(icon: const Icon(Icons.add_box_outlined), tooltip: 'Create group',
+                    onPressed: () => Navigator.push(context,
+                      MaterialPageRoute(builder: (_) => const GroupFormScreen())).then((_) => _load())),
+                IconButton(icon: const Icon(Icons.refresh), onPressed: _load),
+              ]
+            : (_selectMode
+                ? [
+                    _exporting
+                        ? const Padding(padding: EdgeInsets.all(14),
+                            child: SizedBox(width: 20, height: 20,
+                                child: CircularProgressIndicator(strokeWidth: 2, color: AppColors.accent)))
+                        : IconButton(
+                            icon: const Icon(Icons.file_download_outlined),
+                            tooltip: 'Export selected',
+                            onPressed: _selectedStudents.isEmpty ? null : _exportSelectedStudents,
+                          ),
+                    IconButton(icon: const Icon(Icons.close), tooltip: 'Cancel', onPressed: _toggleSelectMode),
+                  ]
+                : [
+                    IconButton(icon: const Icon(Icons.checklist_outlined), tooltip: 'Select students',
+                        onPressed: _students.isEmpty ? null : _toggleSelectMode),
+                    IconButton(icon: const Icon(Icons.person_add_outlined), tooltip: 'Register student',
+                        onPressed: () => Navigator.push(context,
+                          MaterialPageRoute(builder: (_) => const RegisterStudentScreen())).then((_) => _load())),
+                    IconButton(icon: const Icon(Icons.refresh), onPressed: _load),
+                  ]),
       ),
       body: Column(children: [
         Padding(
@@ -152,6 +196,26 @@ class _RosterScreenState extends State<RosterScreen> {
                 ),
               ),
             ),
+            if (_selectMode)
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 0, 16, 4),
+                child: Row(children: [
+                  TextButton(
+                    onPressed: () => setState(() {
+                      final filtered = _query.isEmpty
+                          ? _students
+                          : _students.where((s) => s.name.toLowerCase().contains(_query)).toList();
+                      final allSelected = filtered.every((s) => _selectedStudents.contains(s.name));
+                      if (allSelected) {
+                        for (final s in filtered) _selectedStudents.remove(s.name);
+                      } else {
+                        for (final s in filtered) _selectedStudents.add(s.name);
+                      }
+                    }),
+                    child: const Text('Select / Clear all'),
+                  ),
+                ]),
+              ),
             Expanded(
               child: RefreshIndicator(
                 onRefresh: _load,
@@ -168,11 +232,23 @@ class _RosterScreenState extends State<RosterScreen> {
                     itemCount: filtered.length,
                     separatorBuilder: (_, __) => const SizedBox(height: 10),
                     itemBuilder: (_, i) => _StudentCard(
-                      student:    filtered[i],
-                      summary:    _summary[filtered[i].name] ?? {'present': 0, 'absent': 0},
+                      student:     filtered[i],
+                      summary:     _summary[filtered[i].name] ?? {'present': 0, 'absent': 0},
                       avatarColor: _avatarColor(filtered[i].name),
-                      onDelete:   () => _deleteStudent(filtered[i]),
-                      formatDate: _formatDate,
+                      onDelete:    () => _deleteStudent(filtered[i]),
+                      formatDate:  _formatDate,
+                      selectMode:  _selectMode,
+                      selected:    _selectedStudents.contains(filtered[i].name),
+                      onTap: _selectMode
+                          ? () => setState(() {
+                              final name = filtered[i].name;
+                              if (_selectedStudents.contains(name)) {
+                                _selectedStudents.remove(name);
+                              } else {
+                                _selectedStudents.add(name);
+                              }
+                            })
+                          : null,
                     ),
                   );
                 }),
@@ -324,9 +400,20 @@ class _StudentCard extends StatelessWidget {
   final Color                avatarColor;
   final VoidCallback         onDelete;
   final String Function(String?) formatDate;
+  final bool                 selectMode;
+  final bool                 selected;
+  final VoidCallback?        onTap;
 
-  const _StudentCard({required this.student, required this.summary,
-      required this.avatarColor, required this.onDelete, required this.formatDate});
+  const _StudentCard({
+    required this.student,
+    required this.summary,
+    required this.avatarColor,
+    required this.onDelete,
+    required this.formatDate,
+    this.selectMode = false,
+    this.selected = false,
+    this.onTap,
+  });
 
   static const Color _midColor = Color(0xFFF59E0B);
 
@@ -337,55 +424,69 @@ class _StudentCard extends StatelessWidget {
     final total   = present + absent;
     final pct     = total == 0 ? 0.0 : present / total;
 
-    return Container(
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: AppColors.card,
-        borderRadius: BorderRadius.circular(16),
-        border: Border.all(color: AppColors.cardBorder),
-        boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.04), blurRadius: 8, offset: const Offset(0, 2))],
-      ),
-      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-        Row(children: [
-          Container(
-            width: 44, height: 44,
-            decoration: BoxDecoration(color: avatarColor, shape: BoxShape.circle),
-            child: Center(child: Text(
-              student.name.isNotEmpty ? student.name[0].toUpperCase() : '?',
-              style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.w700),
-            )),
-          ),
-          const SizedBox(width: 12),
-          Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(student.name, style: const TextStyle(color: AppColors.textPrimary, fontSize: 15, fontWeight: FontWeight.w600)),
-            Text('Registered ${formatDate(student.registeredAt)}  ·  ${student.sampleCount} sample(s)',
-                style: const TextStyle(color: AppColors.textSecondary, fontSize: 11)),
-          ])),
-          IconButton(
-            icon: const Icon(Icons.delete_outline, color: AppColors.textMuted, size: 20),
-            onPressed: onDelete, padding: EdgeInsets.zero, constraints: const BoxConstraints()),
-        ]),
-        const SizedBox(height: 14),
-        Row(children: [
-          _StatChip(label: 'Present', value: '$present', color: AppColors.present),
-          const SizedBox(width: 8),
-          _StatChip(label: 'Absent',  value: '$absent',  color: AppColors.textMuted),
-          const SizedBox(width: 8),
-          _StatChip(label: 'Rate', value: '${(pct * 100).toStringAsFixed(0)}%',
-              color: pct >= 0.75 ? AppColors.present : pct >= 0.50 ? _midColor : AppColors.danger),
-        ]),
-        if (total > 0) ...[
-          const SizedBox(height: 10),
-          ClipRRect(
-            borderRadius: BorderRadius.circular(4),
-            child: LinearProgressIndicator(
-              value: pct, minHeight: 4,
-              backgroundColor: AppColors.accentDim,
-              valueColor: AlwaysStoppedAnimation<Color>(pct >= 0.75 ? AppColors.present : AppColors.danger),
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          color: AppColors.card,
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: selected ? AppColors.accent.withOpacity(0.6) : AppColors.cardBorder,
+              width: selected ? 1.4 : 1),
+          boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.04), blurRadius: 8, offset: const Offset(0, 2))],
+        ),
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Row(children: [
+            if (selectMode) ...[
+              Checkbox(
+                value: selected,
+                activeColor: AppColors.accent,
+                onChanged: (_) => onTap?.call(),
+                materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+              ),
+              const SizedBox(width: 4),
+            ],
+            Container(
+              width: 44, height: 44,
+              decoration: BoxDecoration(color: avatarColor, shape: BoxShape.circle),
+              child: Center(child: Text(
+                student.name.isNotEmpty ? student.name[0].toUpperCase() : '?',
+                style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.w700),
+              )),
             ),
-          ),
-        ],
-      ]),
+            const SizedBox(width: 12),
+            Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+              Text(student.name, style: const TextStyle(color: AppColors.textPrimary, fontSize: 15, fontWeight: FontWeight.w600)),
+              Text('Registered ${formatDate(student.registeredAt)}  ·  ${student.sampleCount} sample(s)',
+                  style: const TextStyle(color: AppColors.textSecondary, fontSize: 11)),
+            ])),
+            if (!selectMode)
+              IconButton(
+                icon: const Icon(Icons.delete_outline, color: AppColors.textMuted, size: 20),
+                onPressed: onDelete, padding: EdgeInsets.zero, constraints: const BoxConstraints()),
+          ]),
+          const SizedBox(height: 14),
+          Row(children: [
+            _StatChip(label: 'Present', value: '$present', color: AppColors.present),
+            const SizedBox(width: 8),
+            _StatChip(label: 'Absent',  value: '$absent',  color: AppColors.textMuted),
+            const SizedBox(width: 8),
+            _StatChip(label: 'Rate', value: '${(pct * 100).toStringAsFixed(0)}%',
+                color: pct >= 0.75 ? AppColors.present : pct >= 0.50 ? _midColor : AppColors.danger),
+          ]),
+          if (total > 0) ...[
+            const SizedBox(height: 10),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(4),
+              child: LinearProgressIndicator(
+                value: pct, minHeight: 4,
+                backgroundColor: AppColors.accentDim,
+                valueColor: AlwaysStoppedAnimation<Color>(pct >= 0.75 ? AppColors.present : AppColors.danger),
+              ),
+            ),
+          ],
+        ]),
+      ),
     );
   }
 }

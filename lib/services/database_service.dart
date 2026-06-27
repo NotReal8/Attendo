@@ -64,7 +64,6 @@ class DatabaseService {
       },
       onUpgrade: (db, oldVersion, newVersion) async {
         if (oldVersion < 2) {
-          // Add roll_no column to existing installs
           await db.execute(
             "ALTER TABLE students ADD COLUMN roll_no TEXT NOT NULL DEFAULT ''",
           );
@@ -101,7 +100,6 @@ class DatabaseService {
         0;
   }
 
-  /// Returns a map of student name → roll number for quick lookup during export.
   Future<Map<String, String>> getRollNoMap() async {
     final db   = await database;
     final rows = await db.query('students', columns: ['name', 'roll_no']);
@@ -212,6 +210,17 @@ class DatabaseService {
       where: 'session_date = ? AND session_label = ?',
       whereArgs: [date, label],
       orderBy: 'student_name ASC',
+    )).map(AttendanceRecord.fromMap).toList();
+  }
+
+  /// Returns all attendance records for a single student, ordered by date then session.
+  Future<List<AttendanceRecord>> recordsForStudent(String studentName) async {
+    final db = await database;
+    return (await db.query(
+      'attendance',
+      where: 'student_name = ?',
+      whereArgs: [studentName],
+      orderBy: 'session_date ASC, session_label ASC',
     )).map(AttendanceRecord.fromMap).toList();
   }
 
