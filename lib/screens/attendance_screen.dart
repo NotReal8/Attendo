@@ -9,6 +9,7 @@ import '../models/student.dart';
 import '../services/attendance_service.dart';
 import '../services/database_service.dart';
 import '../services/face_service.dart';
+import '../services/face_worker.dart';
 import '../services/liveness_service.dart';
 import '../services/app_log.dart';
 
@@ -203,7 +204,7 @@ class _AttendanceScreenState extends State<AttendanceScreen>
     _sessionDate  = AttendanceService.todayDate;
     _sessionLabel = AttendanceService.sessionLabel;
     appLog('=== Attendance session: $_sessionLabel ===');
-    _faceService.init();
+    FaceWorker.instance.init();
     _liveness.init();
     _loadStudents();
     _startPreload();
@@ -367,14 +368,9 @@ class _AttendanceScreenState extends State<AttendanceScreen>
   }
 
   Future<void> _processFrame(Uint8List jpeg, int w, int h) async {
-    // ── DIAGNOSTIC: comment out all inference to test preview smoothness ──
-    _processing = false;
-    return;
-    // ─────────────────────────────────────────────────────────────────────
-
     final now = DateTime.now();
     try {
-      final detection = await _faceService.matchFaceWithBox(
+      final detection = await FaceWorker.instance.matchFaceWithBox(
         jpeg,
         _students,
         w,
@@ -829,22 +825,6 @@ class _AttendanceScreenState extends State<AttendanceScreen>
               children: [
                 CameraPreview(_cam!),
 
-                if (_faceBox != null)
-                  _FaceBoxOverlay(
-                    box:            _faceBox!,
-                    color:          _boxColor(),
-                    bakedImageSize: _bakedImageSize,
-                    cameraAspect:   _cam!.value.aspectRatio,
-                    landmarks:      _landmarks,
-                    label: _faceMatched && _lastDetected.isNotEmpty
-                        ? _lastDetected.first
-                        : (_lastResults.isNotEmpty &&
-                                _lastResults.first.similarity >=
-                                    _faceService.matchThreshold
-                            ? _lastResults.first.name
-                            : null),
-                  ),
-
                 Positioned(
                   top: 12, left: 60, right: 60,
                   child: _GuidanceBanner(
@@ -1120,125 +1100,6 @@ class _GuidanceBanner extends StatelessWidget {
               fontWeight: FontWeight.w600),
         ),
       );
-}
-
-// ── Face bounding box overlay ──────────────────────────────────
-
-class _FaceBoxOverlay extends StatelessWidget {
-  final Rect    box;
-  final Color   color;
-  final String? label;
-  final Size?   bakedImageSize;
-  final double  cameraAspect;
-  final List<Offset>? landmarks;
-
-  const _FaceBoxOverlay({
-    required this.box,
-    required this.color,
-    required this.cameraAspect,
-    this.bakedImageSize,
-    this.label,
-    this.landmarks,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return LayoutBuilder(
-      builder: (_, constraints) {
-        final screenW = constraints.maxWidth;
-        final screenH = constraints.maxHeight;
-
-        final double imgAspect = bakedImageSize != null
-            ? bakedImageSize!.width / bakedImageSize!.height
-            : (screenW / screenH);
-
-        double renderW, renderH, offsetX, offsetY;
-        if (screenW / screenH > imgAspect) {
-          renderW = screenW;
-          renderH = screenW / imgAspect;
-          offsetX = 0;
-          offsetY = (screenH - renderH) / 2;
-        } else {
-          renderH = screenH;
-          renderW = screenH * imgAspect;
-          offsetX = (screenW - renderW) / 2;
-          offsetY = 0;
-        }
-
-        final left   = offsetX + box.left   * renderW;
-        final top    = offsetY + box.top    * renderH;
-        final width  =           box.width  * renderW;
-        final height =           box.height * renderH;
-
-        List<Offset> screenKps = const [];
-        if (landmarks != null && landmarks!.length == 5) {
-          screenKps = landmarks!.map((p) =>
-              Offset(offsetX + p.dy * renderW, offsetY + p.dx * renderH)).toList();
-        }
-
-        return Stack(children: [
-          Positioned(
-            left: left, top: top, width: width, height: height,
-            child: Container(
-              decoration: BoxDecoration(
-                border: Border.all(color: color, width: 2.5),
-                borderRadius: BorderRadius.circular(6),
-                color: color.withOpacity(0.06),
-              ),
-            ),
-          ),
-          if (screenKps.length == 5) ...[
-            _LandmarkDot(pos: screenKps[0], dotColor: const Color(0xFF00E5FF)),
-            _LandmarkDot(pos: screenKps[1], dotColor: const Color(0xFF00E5FF)),
-            _LandmarkDot(pos: screenKps[2], dotColor: const Color(0xFFFFEB3B)),
-            _LandmarkDot(pos: screenKps[3], dotColor: const Color(0xFFFF9800)),
-            _LandmarkDot(pos: screenKps[4], dotColor: const Color(0xFFFF9800)),
-          ],
-          if (label != null)
-            Positioned(
-              left: left,
-              top: (top + height + 4).clamp(0, screenH - 24),
-              child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                decoration: BoxDecoration(
-                  color: color.withOpacity(0.88),
-                  borderRadius: BorderRadius.circular(6),
-                ),
-                child: Text(label!,
-                    style: const TextStyle(
-                        color: Colors.white,
-                        fontSize: 11,
-                        fontWeight: FontWeight.w600)),
-              ),
-            ),
-        ]);
-      },
-    );
-  }
-}
-
-class _LandmarkDot extends StatelessWidget {
-  final Offset pos;
-  final Color  dotColor;
-  const _LandmarkDot({required this.pos, required this.dotColor});
-
-  @override
-  Widget build(BuildContext context) {
-    return Positioned(
-      left: pos.dx - 4,
-      top:  pos.dy - 4,
-      child: Container(
-        width: 8, height: 8,
-        decoration: BoxDecoration(
-          shape: BoxShape.circle,
-          color: dotColor,
-          boxShadow: [
-            BoxShadow(color: Colors.black54, blurRadius: 2, spreadRadius: 0),
-          ],
-        ),
-      ),
-    );
-  }
 }
 
 // ── Sub-widgets ────────────────────────────────────────────────
