@@ -70,7 +70,25 @@ class EnrollmentService {
 
   Future<List<Student>> getEnrolledStudents() => _db.getAllStudents();
 
-  Future<void> deleteStudent(String name) => _db.deleteStudent(name);
+  Future<void> deleteStudent(String name) async {
+  await _db.deleteStudent(name);
+
+  try {
+    final prefs    = await SharedPreferences.getInstance();
+    final orgId    = prefs.getString('org_id')       ?? '';
+    final acctName = prefs.getString('account_name') ?? '';
+    if (orgId.isNotEmpty && acctName.isNotEmpty) {
+      await FirebaseFirestore.instance
+          .collection('orgs').doc(orgId)
+          .collection('accounts').doc(acctName)
+          .collection('students').doc(name)
+          .delete();
+      appLog('[EnrollmentService] Firestore delete done ✅ "$name"');
+    }
+  } catch (e) {
+    appLog('[EnrollmentService] Firestore delete failed (non-fatal): $e');
+  }
+}
 
   Future<void> resetEnrollment() async {
     await _db.resetAllData();

@@ -116,29 +116,43 @@ class AttendanceService {
   }
 
   Future<void> syncStatusUpdate({
-    required String orgId,
-    required String date,
-    required String label,
-    required String studentName,
-    required String newStatus,
-    required String accountName,
-  }) async {
-    try {
-      await FirebaseFirestore.instance
-          .collection('orgs').doc(orgId)
-          .collection('accounts').doc(accountName)
-          .collection('attendance').doc(date)
-          .collection(label).doc(studentName)
-          .update({
-        'status':     newStatus,
-        'updated_at': FieldValue.serverTimestamp(),
-        'updated_by': accountName,
-      });
-      appLog('[AttendanceService] Firestore status sync done ✅ $studentName→$newStatus');
-    } catch (e) {
-      appLog('[AttendanceService] Firestore status sync failed (non-fatal): $e');
-    }
+  required String orgId,
+  required String date,
+  required String label,
+  required String studentName,
+  required String newStatus,
+  required String accountName,
+}) async {
+  try {
+    final fs      = FirebaseFirestore.instance;
+    final acctRef = fs.collection('orgs').doc(orgId)
+        .collection('accounts').doc(accountName);
+
+    await acctRef
+        .collection('attendance').doc(date)
+        .collection(label).doc(studentName)
+        .update({
+      'status':     newStatus,
+      'updated_at': FieldValue.serverTimestamp(),
+      'updated_by': accountName,
+    });
+
+    final flatDocId = '${date}__${label}__${studentName}'
+        .replaceAll(' ', '_')
+        .replaceAll('·', '-');
+    await acctRef
+        .collection('attendance_flat').doc(flatDocId)
+        .update({
+      'status':     newStatus,
+      'updated_at': FieldValue.serverTimestamp(),
+      'updated_by': accountName,
+    });
+
+    appLog('[AttendanceService] Firestore status sync done ✅ $studentName→$newStatus');
+  } catch (e) {
+    appLog('[AttendanceService] Firestore status sync failed (non-fatal): $e');
   }
+}
 
   Future<List<String>> getSessionDates() async => _db.distinctDates();
 
