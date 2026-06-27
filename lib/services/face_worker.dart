@@ -1,10 +1,4 @@
 // lib/services/face_worker.dart
-//
-// Runs FaceService's existing, UNMODIFIED matchFaceWithBox() on a persistent
-// background isolate so ONNX inference never blocks the UI/raster thread.
-// Dart statics are per-isolate, so the worker gets its own FaceService
-// singleton + its own ONNX sessions — face_service.dart itself is untouched.
-
 import 'dart:async';
 import 'dart:isolate';
 import 'dart:typed_data';
@@ -42,11 +36,14 @@ class FaceWorker {
       throw Exception('FaceWorker.init() must be called from the main isolate');
     }
 
+    final detBytes = (await rootBundle.load('assets/models/det_500m.onnx')).buffer.asUint8List();
+    final embBytes = (await rootBundle.load('assets/models/w600k_mbf.onnx')).buffer.asUint8List();
+
     _mainReceivePort.listen(_onMessage);
 
     _isolate = await Isolate.spawn(
       _faceWorkerEntry,
-      [_mainReceivePort.sendPort, token],
+      [_mainReceivePort.sendPort, token, detBytes, embBytes],
     );
 
     await _readyCompleter!.future;
@@ -61,9 +58,6 @@ class FaceWorker {
       return;
     }
     if (message is Map) {
-      // Forwarded appLog() line from inside the worker isolate — AppLog is
-      // per-isolate, so without this the worker's own init/detection logs
-      // (including silent init failures) never reach the on-screen log.
       final log = message['log'];
       if (log is String) {
         appLog('[Worker] $log');
@@ -142,19 +136,14 @@ class FaceWorker {
   }
 }
 
-// ── Worker isolate entry point ───────────────────────────────────
-
 void _faceWorkerEntry(List<dynamic> args) async {
   final SendPort mainSendPort = args[0] as SendPort;
   final RootIsolateToken token = args[1] as RootIsolateToken;
+  final Uint8List detBytes = args[2] as Uint8List;
+  final Uint8List embBytes = args[3] as Uint8List;
 
   BackgroundIsolateBinaryMessenger.ensureInitialized(token);
 
-  // Forward every appLog() line generated inside this isolate back to the
-  // main isolate. AppLog.instance here is a SEPARATE instance from the one
-  // the UI watches — without this, FaceService.init() failures (model load,
-  // ONNX session creation) are logged but invisible, and matchFaceWithBox
-  // just silently returns empty results forever.
   int lastSentLogIndex = 0;
   AppLog.instance.addListener(() {
     final entries = AppLog.instance.entries;
@@ -167,7 +156,7 @@ void _faceWorkerEntry(List<dynamic> args) async {
   });
 
   final faceService = FaceService();
-  await faceService.init();
+  await faceService.init(preloadedDetBytes: detBytes, preloadedEmbBytes: embBytes);
 
   final workerReceivePort = ReceivePort();
   mainSendPort.send(workerReceivePort.sendPort);
