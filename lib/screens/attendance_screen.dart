@@ -39,31 +39,23 @@ class _AttendanceScreenState extends State<AttendanceScreen>
   final Set<String> _lastDetected = {};
   List<MatchResult> _lastResults  = [];
 
-  /// Normalized face box [0..1] — coords relative to the baked image.
-  /// Held for _boxHoldMs after the last detection to avoid flickering.
   Rect? _faceBox;
   bool  _faceMatched = false;
 
-  /// Normalized 5-point landmarks [0..1] — same coordinate space as _faceBox.
   List<Offset>? _landmarks;
 
-  /// Actual baked image size that SCRFD ran against (post-bakeOrientation)
   Size? _bakedImageSize;
 
-  // Position guidance from latest detection
   double? _faceEulerY;
   double? _faceEulerX;
   double? _faceWidthRatio;
 
-  // Temporal voting
   String? _votingName;
   int     _voteCount = 0;
 
-  // Cooldown
   final Map<String, DateTime> _cooldown = {};
   static const int _cooldownSecs = 6;
 
-  // ── Liveness state ────────────────────────────────────────
   bool   _livenessChecking = false;
   bool   _livenessFailed   = false;
 
@@ -76,20 +68,15 @@ class _AttendanceScreenState extends State<AttendanceScreen>
   late String _sessionDate;
   late String _sessionLabel;
 
-  // ── Box hold — prevents box from vanishing between 650ms inference cycles ──
-  // When inference returns no face, we wait this long before clearing _faceBox.
-  // This makes the overlay appear stable instead of blinking in and out.
   static const int _boxHoldMs = 400;
   Timer? _boxClearTimer;
 
-  // ── Stale watchdog ────────────────────────────────────────
   static const int _staleMs = 2000;
   static const int _staleCheckMs = 500;
   Timer? _staleTimer;
   DateTime? _lastRawFrameAt;
   bool _staleFired = false;
 
-  // ── Recovery ──────────────────────────────────────────────
   bool _recovering   = false;
   bool _recoveryBusy = false;
   int  _recoveryAttempts = 0;
@@ -97,7 +84,6 @@ class _AttendanceScreenState extends State<AttendanceScreen>
   static const int _stabilizeWindowMs = 3500;
   Timer? _stabilizeWindowTimer;
 
-  // ── Preload ───────────────────────────────────────────────
   bool  _preloading  = true;
   bool  _preloadErr  = false;
   int   _retryCount  = 0;
@@ -381,6 +367,11 @@ class _AttendanceScreenState extends State<AttendanceScreen>
   }
 
   Future<void> _processFrame(Uint8List jpeg, int w, int h) async {
+    // ── DIAGNOSTIC: comment out all inference to test preview smoothness ──
+    _processing = false;
+    return;
+    // ─────────────────────────────────────────────────────────────────────
+
     final now = DateTime.now();
     try {
       final detection = await _faceService.matchFaceWithBox(
@@ -400,7 +391,6 @@ class _AttendanceScreenState extends State<AttendanceScreen>
       final bakedSize  = detection.bakedImageSize;
 
       if (box != null) {
-        // Face detected — cancel any pending box-clear and update immediately.
         _boxClearTimer?.cancel();
         _boxClearTimer = null;
         setState(() {
@@ -414,11 +404,8 @@ class _AttendanceScreenState extends State<AttendanceScreen>
           _landmarks        = detection.landmarks;
         });
       } else {
-        // No face — hold the existing box for _boxHoldMs before clearing.
-        // This prevents the box from blinking out between 650ms inference gaps.
         setState(() {
           _lastResults = results;
-          // _faceBox intentionally NOT cleared here — held until timer fires
           _faceEulerY     = null;
           _faceEulerX     = null;
           _faceWidthRatio = null;
