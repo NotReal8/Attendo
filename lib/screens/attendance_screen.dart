@@ -39,12 +39,12 @@ class _AttendanceScreenState extends State<AttendanceScreen>
   final Set<String> _lastDetected = {};
   List<MatchResult> _lastResults  = [];
 
-  /// Normalized face box [0..1] — coords relative to the baked image
+  /// Normalized face box [0..1] — coords relative to the baked image.
+  /// Held for _boxHoldMs after the last detection to avoid flickering.
   Rect? _faceBox;
   bool  _faceMatched = false;
 
   /// Normalized 5-point landmarks [0..1] — same coordinate space as _faceBox.
-  /// Order: left-eye, right-eye, nose tip, left-mouth, right-mouth.
   List<Offset>? _landmarks;
 
   /// Actual baked image size that SCRFD ran against (post-bakeOrientation)
@@ -55,11 +55,11 @@ class _AttendanceScreenState extends State<AttendanceScreen>
   double? _faceEulerX;
   double? _faceWidthRatio;
 
-  // Temporal voting — confirmation driven by FaceService.castVote.
+  // Temporal voting
   String? _votingName;
-  int     _voteCount = 0; // UI-only display counter (mirrors FaceService buffer)
+  int     _voteCount = 0;
 
-  // Cooldown — prevents re-marking someone just confirmed
+  // Cooldown
   final Map<String, DateTime> _cooldown = {};
   static const int _cooldownSecs = 6;
 
@@ -70,53 +70,41 @@ class _AttendanceScreenState extends State<AttendanceScreen>
   static const int _frameMs = 650;
   DateTime?  _lastFrame;
 
-  /// Latest raw JPEG from the camera stream — consumed by frameSupplier during liveness voting.
   Uint8List? _latestJpeg;
-  /// Timestamp of _latestJpeg — frameSupplier uses this to guarantee frame freshness.
   DateTime?  _latestJpegTime;
 
   late String _sessionDate;
   late String _sessionLabel;
 
-  // ── Watchdog: clears stale UI state when frames stop arriving ──
-  // Driven by RAW camera callback arrival (not by inference cadence), so it
-  // reflects an actual HAL freeze rather than how busy _processFrame is.
-  // A single Timer.periodic just polls "how long since the last raw frame" —
-  // this avoids both (a) the original per-frame Timer alloc/cancel churn,
-  // and (b) coupling staleness to the (slow, variable-length) recognition
-  // pipeline, which caused false-positive recovery loops.
+  // ── Box hold — prevents box from vanishing between 650ms inference cycles ──
+  // When inference returns no face, we wait this long before clearing _faceBox.
+  // This makes the overlay appear stable instead of blinking in and out.
+  static const int _boxHoldMs = 400;
+  Timer? _boxClearTimer;
+
+  // ── Stale watchdog ────────────────────────────────────────
   static const int _staleMs = 2000;
   static const int _staleCheckMs = 500;
   Timer? _staleTimer;
   DateTime? _lastRawFrameAt;
   bool _staleFired = false;
 
-  // ── Recovery: stale watchdog triggers a full camera teardown+reinit ──
-  // (mirrors what a notification-shade interruption forces by accident).
-  // _recovering spans teardown → reinit → stabilization observation.
-  // _recoveryBusy guards only the active teardown/reinit async section so
-  // a re-freeze during the stabilization window still triggers a fresh attempt
-  // instead of being swallowed.
+  // ── Recovery ──────────────────────────────────────────────
   bool _recovering   = false;
   bool _recoveryBusy = false;
   int  _recoveryAttempts = 0;
   static const int _maxRecoveryAttempts = 3;
-  // Stream must run freeze-free for this long after reinit before it's trusted —
-  // prevents re-trusting a stream that dies again after a single frame.
   static const int _stabilizeWindowMs = 3500;
   Timer? _stabilizeWindowTimer;
 
-  // ── Preload / retry state ─────────────────────────────────
-  bool  _preloading  = true;   // hides camera until first real frame arrives
-  bool  _preloadErr  = false;  // true after _maxRetries exhausted
+  // ── Preload ───────────────────────────────────────────────
+  bool  _preloading  = true;
+  bool  _preloadErr  = false;
   int   _retryCount  = 0;
   static const int _maxRetries       = 3;
-  static const int _preloadWatchdogMs = 3000; // ms to wait for first frame
+  static const int _preloadWatchdogMs = 3000;
   Timer? _preloadWatchdog;
 
-  // Updates the last-seen timestamp and (re)arms the periodic checker.
-  // Cheap: no Timer allocation on the hot path — Timer.periodic is created
-  // once and left running for the lifetime of the camera session.
   void _resetStaleTimer() {
     _lastRawFrameAt = DateTime.now();
     _staleFired = false;
@@ -133,6 +121,7 @@ class _AttendanceScreenState extends State<AttendanceScreen>
     if (!mounted) return;
     appLog('[Frame] stale watchdog fired — clearing UI state and triggering recovery');
     _processing = false;
+    _boxClearTimer?.cancel();
     setState(() {
       _faceBox        = null;
       _lastResults    = [];
@@ -148,9 +137,6 @@ class _AttendanceScreenState extends State<AttendanceScreen>
     _handleStaleDetected();
   }
 
-  // Entry point for any stale-frame detection. Safe to call repeatedly —
-  // ignores overlap with an in-flight teardown/reinit, but still escalates
-  // a re-freeze that happens during the post-reinit stabilization window.
   void _handleStaleDetected() {
     if (_recoveryBusy) {
       appLog('[Recovery] stale fired mid-recovery — ignoring overlap');
@@ -231,8 +217,8 @@ class _AttendanceScreenState extends State<AttendanceScreen>
     _sessionDate  = AttendanceService.todayDate;
     _sessionLabel = AttendanceService.sessionLabel;
     appLog('=== Attendance session: $_sessionLabel ===');
-    _faceService.init(); // pre-warm SCRFD + ArcFace — non-blocking
-    _liveness.init();   // pre-warm MiniFASNet — non-blocking
+    _faceService.init();
+    _liveness.init();
     _loadStudents();
     _startPreload();
   }
@@ -247,8 +233,6 @@ class _AttendanceScreenState extends State<AttendanceScreen>
       appLog('[Attendance] ⚠️ No students enrolled in this domain — add students to the group first');
     }
   }
-
-  // ── Preload orchestration ─────────────────────────────────
 
   void _startPreload() {
     _retryCount = 0;
@@ -279,13 +263,11 @@ class _AttendanceScreenState extends State<AttendanceScreen>
       return;
     }
 
-    // _initCam succeeded — arm preload watchdog.
-    // If no frame arrives within _preloadWatchdogMs, HAL is stalled → retry.
     _preloadWatchdog?.cancel();
     _preloadWatchdog = Timer(
         const Duration(milliseconds: _preloadWatchdogMs), () {
       if (!mounted) return;
-      if (!_preloading) return; // first frame already cleared it
+      if (!_preloading) return;
       appLog('[Preload] watchdog fired — no frame after ${_preloadWatchdogMs}ms → retry');
       _retryCount++;
       if (_retryCount >= _maxRetries) {
@@ -293,7 +275,6 @@ class _AttendanceScreenState extends State<AttendanceScreen>
         setState(() { _preloadErr = true; });
         return;
       }
-      // Tear down stalled camera silently, then retry
       _cam?.stopImageStream().catchError((_) {});
       _cam?.dispose();
       _cam = null;
@@ -304,7 +285,6 @@ class _AttendanceScreenState extends State<AttendanceScreen>
     });
   }
 
-  /// Returns true on success, false on any failure.
   Future<bool> _initCam() async {
     appLog('[Attendance] _initCam() START');
     _processing = false;
@@ -352,7 +332,6 @@ class _AttendanceScreenState extends State<AttendanceScreen>
         appLog('[Attendance] setExposureMode not supported (non-fatal): $e');
       }
 
-      // Allow the HAL pipeline to drain before streaming begins.
       await Future.delayed(const Duration(milliseconds: 500));
 
       await _cam!.startImageStream(_onFrame);
@@ -372,11 +351,6 @@ class _AttendanceScreenState extends State<AttendanceScreen>
   }
 
   void _onFrame(CameraImage image) {
-    // MUST be synchronous — async callbacks cause Android to stop delivering frames.
-
-    // Unconditional, cheap (timestamp only) — tracks raw camera delivery
-    // independent of inference cadence, so the stale watchdog reflects
-    // actual HAL freezes rather than how busy _processFrame currently is.
     _resetStaleTimer();
 
     if (_preloading) {
@@ -389,14 +363,10 @@ class _AttendanceScreenState extends State<AttendanceScreen>
 
     final now = DateTime.now();
 
-    // Throttle check BEFORE any allocation — keeps _onFrame cheap on every frame.
     if (_processing) return;
     if (_lastFrame != null &&
         now.difference(_lastFrame!).inMilliseconds < _frameMs) return;
 
-    // Only copy bytes when we're actually going to process this frame.
-    // The buffer is reused by the plugin so the copy is still required,
-    // but doing it here means 29 out of 30 frames incur zero allocation.
     final jpeg = Uint8List.fromList(image.planes[0].bytes);
     final w    = image.width;
     final h    = image.height;
@@ -407,7 +377,6 @@ class _AttendanceScreenState extends State<AttendanceScreen>
     _processing = true;
     _lastFrame  = now;
 
-    // Dispatch inference asynchronously so _onFrame returns immediately.
     _processFrame(jpeg, w, h);
   }
 
@@ -430,22 +399,45 @@ class _AttendanceScreenState extends State<AttendanceScreen>
       final widthRatio = detection.faceWidthRatio;
       final bakedSize  = detection.bakedImageSize;
 
-      setState(() {
-        _lastResults      = results;
-        _faceBox          = box;
-        _faceMatched      = false;
-        _faceEulerY       = eulerY;
-        _faceEulerX       = eulerX;
-        _faceWidthRatio   = widthRatio;
-        if (bakedSize != null) _bakedImageSize = bakedSize;
-        _landmarks        = detection.landmarks;
-      });
+      if (box != null) {
+        // Face detected — cancel any pending box-clear and update immediately.
+        _boxClearTimer?.cancel();
+        _boxClearTimer = null;
+        setState(() {
+          _lastResults      = results;
+          _faceBox          = box;
+          _faceMatched      = false;
+          _faceEulerY       = eulerY;
+          _faceEulerX       = eulerX;
+          _faceWidthRatio   = widthRatio;
+          if (bakedSize != null) _bakedImageSize = bakedSize;
+          _landmarks        = detection.landmarks;
+        });
+      } else {
+        // No face — hold the existing box for _boxHoldMs before clearing.
+        // This prevents the box from blinking out between 650ms inference gaps.
+        setState(() {
+          _lastResults = results;
+          // _faceBox intentionally NOT cleared here — held until timer fires
+          _faceEulerY     = null;
+          _faceEulerX     = null;
+          _faceWidthRatio = null;
+        });
+        _boxClearTimer?.cancel();
+        _boxClearTimer = Timer(const Duration(milliseconds: _boxHoldMs), () {
+          if (!mounted) return;
+          setState(() {
+            _faceBox      = null;
+            _landmarks    = null;
+            _faceMatched  = false;
+          });
+        });
+      }
 
       if (results.isEmpty || box == null) {
         if (mounted) setState(() {
           _votingName = null;
           _voteCount  = 0;
-          _landmarks  = null;
           _livenessFailed = false;
         });
         return;
@@ -461,17 +453,13 @@ class _AttendanceScreenState extends State<AttendanceScreen>
         return;
       }
 
-      // Already confirmed this session — skip voting
       if (_presentNames.contains(best.name)) return;
 
-      // Cooldown guard
       final last = _cooldown[best.name];
       if (last != null && now.difference(last).inSeconds < _cooldownSecs) return;
 
-      // ── Temporal vote ─────────────────────────────────────
       final confirmed = _faceService.castVote(best.name, best.similarity);
 
-      // Update UI vote counter — cap at votesRequired so badge never shows 3/2, 4/2
       final buf = _faceService.voteBufferFor(best.name)
           .clamp(0, FaceService.votesRequired);
       if (mounted) {
@@ -484,9 +472,6 @@ class _AttendanceScreenState extends State<AttendanceScreen>
       if (confirmed) {
         appLog('[Attendance] Vote confirmed for ${best.name} ✅');
 
-        // ── MiniFASNet liveness gate (multi-frame voting) ──
-        // Run ONLY here — after vote confirmation, not every frame.
-        // frameSupplier captures the latest JPEG from the stream on demand.
         if (mounted) setState(() => _livenessChecking = true);
 
         final bakedSize2 = _bakedImageSize;
@@ -499,9 +484,6 @@ class _AttendanceScreenState extends State<AttendanceScreen>
           return;
         }
 
-        // Capture frames on demand from the live stream.
-        // Each call waits for a JPEG that arrived strictly after the call began,
-        // guaranteeing frames 1/2/3 are distinct captures from the camera.
         Future<Uint8List?> frameSupplier() async {
           final callTime = DateTime.now();
           for (int i = 0; i < 20; i++) {
@@ -523,7 +505,6 @@ class _AttendanceScreenState extends State<AttendanceScreen>
         );
 
         if (result == null) {
-          // Model not ready or preprocessing failed — fail safe: reject
           appLog('[Liveness] result null — rejecting as inconclusive');
           _faceService.clearVotes(best.name);
           if (mounted) setState(() {
@@ -590,6 +571,8 @@ class _AttendanceScreenState extends State<AttendanceScreen>
     _staleTimer?.cancel();
     _staleTimer = null;
     _stabilizeWindowTimer?.cancel();
+    _boxClearTimer?.cancel();
+    _boxClearTimer = null;
     _recovering   = false;
     _recoveryBusy = false;
     _processing = false;
@@ -600,6 +583,8 @@ class _AttendanceScreenState extends State<AttendanceScreen>
       _camReady   = false;
       _preloading = true;
       _preloadErr = false;
+      _faceBox    = null;
+      _landmarks  = null;
       _lensDirection = _lensDirection == CameraLensDirection.front
           ? CameraLensDirection.back
           : CameraLensDirection.front;
@@ -633,24 +618,16 @@ class _AttendanceScreenState extends State<AttendanceScreen>
     );
     if (ok != true) return;
 
-    // Fully close the camera BEFORE processing. stopImageStream() alone
-    // leaves _staleTimer/_preloadWatchdog armed, so the frame gap during
-    // saveSession() trips stale-detection -> recovery reinit, causing the
-    // "Preparing camera" flicker loop while saving. Tear everything down
-    // first so no recovery can fire mid-save.
     _preloadWatchdog?.cancel();
     _staleTimer?.cancel();
     _staleTimer = null;
     _stabilizeWindowTimer?.cancel();
+    _boxClearTimer?.cancel();
+    _boxClearTimer = null;
     _recovering   = false;
     _recoveryBusy = false;
     _processing   = false;
 
-    // _cam and _camReady must flip together in one setState — nulling _cam
-    // outside setState left a window where a rebuild (e.g. triggered by the
-    // confirm dialog's Navigator.pop, or the await below) could run with
-    // _camReady still true but _cam already null, hitting `_cam!` in build()
-    // and throwing the null-check error briefly before settling.
     final cam = _cam;
     if (mounted) {
       setState(() {
@@ -739,6 +716,8 @@ class _AttendanceScreenState extends State<AttendanceScreen>
       _staleTimer?.cancel();
       _staleTimer = null;
       _stabilizeWindowTimer?.cancel();
+      _boxClearTimer?.cancel();
+      _boxClearTimer = null;
       _recovering   = false;
       _recoveryBusy = false;
       _processing = false;
@@ -760,13 +739,13 @@ class _AttendanceScreenState extends State<AttendanceScreen>
     _preloadWatchdog?.cancel();
     _staleTimer?.cancel();
     _stabilizeWindowTimer?.cancel();
+    _boxClearTimer?.cancel();
     WidgetsBinding.instance.removeObserver(this);
     _faceService.clearAllVotes();
     _cam?.dispose();
     super.dispose();
   }
 
-  // ── Guidance text ─────────────────────────────────────────
   String _guidanceText() {
     if (_faceBox == null) return 'Look straight at the camera';
 
@@ -861,10 +840,8 @@ class _AttendanceScreenState extends State<AttendanceScreen>
           ? Stack(
               fit: StackFit.expand,
               children: [
-                // ── Camera preview ──────────────────────────
                 CameraPreview(_cam!),
 
-                // ── Face bounding box overlay ───────────────
                 if (_faceBox != null)
                   _FaceBoxOverlay(
                     box:            _faceBox!,
@@ -881,7 +858,6 @@ class _AttendanceScreenState extends State<AttendanceScreen>
                             : null),
                   ),
 
-                // ── Guidance banner ─────────────────────────
                 Positioned(
                   top: 12, left: 60, right: 60,
                   child: _GuidanceBanner(
@@ -890,7 +866,6 @@ class _AttendanceScreenState extends State<AttendanceScreen>
                   ),
                 ),
 
-                // ── Recovery banner ─────────────────────────
                 if (_recovering)
                   Positioned(
                     top: 56, left: 0, right: 0,
@@ -913,13 +888,11 @@ class _AttendanceScreenState extends State<AttendanceScreen>
                     ),
                   ),
 
-                // ── Status dot ──────────────────────────────
                 Positioned(
                   top: 12, left: 12,
                   child: _StatusDot(processing: _processing),
                 ),
 
-                // ── Confidence panel ────────────────────────
                 if (_lastResults.isNotEmpty)
                   Positioned(
                     top: 56, right: 12,
@@ -929,14 +902,12 @@ class _AttendanceScreenState extends State<AttendanceScreen>
                     ),
                   ),
 
-                // ── Marked present badge ────────────────────
                 if (_lastDetected.isNotEmpty)
                   Positioned(
                     top: 100, left: 0, right: 0,
                     child: _DetectionBadge(name: _lastDetected.first),
                   ),
 
-                // ── Voting / verifying badge ─────────────────
                 if (_votingName != null && _voteCount > 0)
                   Positioned(
                     bottom: 196, left: 0, right: 0,
@@ -960,7 +931,6 @@ class _AttendanceScreenState extends State<AttendanceScreen>
                     ),
                   ),
 
-                // ── Liveness checking badge ──────────────────
                 if (_livenessChecking)
                   Positioned(
                     bottom: 240, left: 0, right: 0,
@@ -983,7 +953,6 @@ class _AttendanceScreenState extends State<AttendanceScreen>
                     ),
                   ),
 
-                // ── Liveness failed badge ────────────────────
                 if (_livenessFailed)
                   Positioned(
                     bottom: 240, left: 0, right: 0,
@@ -1006,7 +975,6 @@ class _AttendanceScreenState extends State<AttendanceScreen>
                     ),
                   ),
 
-                // ── No face prompt ──────────────────────────
                 if (_faceBox == null)
                   Positioned(
                     bottom: 196, left: 0, right: 0,
@@ -1029,7 +997,6 @@ class _AttendanceScreenState extends State<AttendanceScreen>
                     ),
                   ),
 
-                // ── Present panel ───────────────────────────
                 Positioned(
                   bottom: 0, left: 0, right: 0,
                   child: _PresentPanel(names: _presentNames),
