@@ -11,6 +11,7 @@ import 'dart:typed_data';
 import 'dart:ui';
 import 'package:flutter/services.dart';
 import 'face_service.dart';
+import 'app_log.dart';
 import '../models/student.dart';
 
 class FaceWorker {
@@ -60,6 +61,14 @@ class FaceWorker {
       return;
     }
     if (message is Map) {
+      // Forwarded appLog() line from inside the worker isolate — AppLog is
+      // per-isolate, so without this the worker's own init/detection logs
+      // (including silent init failures) never reach the on-screen log.
+      final log = message['log'];
+      if (log is String) {
+        appLog('[Worker] $log');
+        return;
+      }
       final id = message['id'] as int?;
       if (id != null) _pending.remove(id)?.complete(message as Map<String, dynamic>);
     }
@@ -140,6 +149,22 @@ void _faceWorkerEntry(List<dynamic> args) async {
   final RootIsolateToken token = args[1] as RootIsolateToken;
 
   BackgroundIsolateBinaryMessenger.ensureInitialized(token);
+
+  // Forward every appLog() line generated inside this isolate back to the
+  // main isolate. AppLog.instance here is a SEPARATE instance from the one
+  // the UI watches — without this, FaceService.init() failures (model load,
+  // ONNX session creation) are logged but invisible, and matchFaceWithBox
+  // just silently returns empty results forever.
+  int lastSentLogIndex = 0;
+  AppLog.instance.addListener(() {
+    final entries = AppLog.instance.entries;
+    if (entries.length > lastSentLogIndex) {
+      for (int i = lastSentLogIndex; i < entries.length; i++) {
+        mainSendPort.send({'log': entries[i]});
+      }
+      lastSentLogIndex = entries.length;
+    }
+  });
 
   final faceService = FaceService();
   await faceService.init();
