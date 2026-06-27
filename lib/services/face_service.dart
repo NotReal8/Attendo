@@ -123,8 +123,19 @@ class FaceService {
   }
 
   // ── Init ──────────────────────────────────────────────────
+  //
+  // [preloadedDetBytes]/[preloadedEmbBytes]: pass these to skip rootBundle.load()
+  // entirely. Required when init() is called from a background Isolate.spawn()
+  // worker — rootBundle/ServicesBinding.instance only exists on the main
+  // isolate, so calling rootBundle.load() from a spawned isolate throws
+  // "Binding has not yet been initialized." and init() fails every time.
+  // Callers on the main isolate (e.g. register_student_screen.dart) can keep
+  // calling init() with no args — behavior is unchanged for them.
 
-  Future<void> init() async {
+  Future<void> init({
+    Uint8List? preloadedDetBytes,
+    Uint8List? preloadedEmbBytes,
+  }) async {
     if (_ready) return;
     if (_initializing) {
       while (_initializing) await Future.delayed(const Duration(milliseconds: 50));
@@ -142,8 +153,8 @@ class FaceService {
 
       // Load SCRFD detector
       appLog('[FaceService] Loading det_500m.onnx...');
-      final detBytes = (await rootBundle.load('assets/models/det_500m.onnx'))
-          .buffer.asUint8List();
+      final detBytes = preloadedDetBytes ??
+          (await rootBundle.load('assets/models/det_500m.onnx')).buffer.asUint8List();
       _detSession   = OrtSession.fromBuffer(detBytes, opts);
       _detInputName = _detSession!.inputNames.first;
       appLog('[FaceService] det_500m loaded ✅ input=$_detInputName '
@@ -151,8 +162,8 @@ class FaceService {
 
       // Load ArcFace embedder
       appLog('[FaceService] Loading w600k_mbf.onnx...');
-      final embBytes = (await rootBundle.load('assets/models/w600k_mbf.onnx'))
-          .buffer.asUint8List();
+      final embBytes = preloadedEmbBytes ??
+          (await rootBundle.load('assets/models/w600k_mbf.onnx')).buffer.asUint8List();
       _embSession   = OrtSession.fromBuffer(embBytes, opts);
       _embInputName = _embSession!.inputNames.first;
       appLog('[FaceService] w600k_mbf loaded ✅ input=$_embInputName');
