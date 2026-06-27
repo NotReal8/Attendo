@@ -321,9 +321,12 @@ class LivenessService {
       // AFTER (insert here):
       appLog('[Liveness] RAW logits: [0]=${logits[0].toStringAsFixed(4)} [1]=${logits[1].toStringAsFixed(4)}');
 
+      // Model output per header doc: index 0 = p_spoof, index 1 = p_real.
+      // Previous code had these swapped, causing real faces to read the
+      // spoof slot — flagging everything as spoof.
       final softmax = _softmax2(logits[0], logits[1]);
-      final pReal  = softmax[0];  // was softmax[1]
-      final pSpoof = softmax[1];  // was softmax[0]
+      final pSpoof = softmax[0];
+      final pReal  = softmax[1];
 
       final inferenceMs = DateTime.now().difference(t0).inMilliseconds;
       final isReal = pReal >= _realThreshold;

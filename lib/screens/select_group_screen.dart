@@ -16,6 +16,7 @@ class _SelectGroupScreenState extends State<SelectGroupScreen> {
   List<StudentGroup> _groups = [];
   int _allCount = 0;
   bool _loading = true;
+  bool _antiSpoofEnabled = true;
 
   @override
   void initState() {
@@ -33,7 +34,11 @@ class _SelectGroupScreenState extends State<SelectGroupScreen> {
 
   void _start({int? groupId, required String groupName}) {
     Navigator.of(context).pushReplacement(MaterialPageRoute(
-      builder: (_) => AttendanceScreen(groupId: groupId, groupName: groupName),
+      builder: (_) => AttendanceScreen(
+        groupId: groupId,
+        groupName: groupName,
+        antiSpoofEnabled: _antiSpoofEnabled,
+      ),
     ));
   }
 
@@ -53,6 +58,27 @@ class _SelectGroupScreenState extends State<SelectGroupScreen> {
           : ListView(
               padding: const EdgeInsets.all(16),
               children: [
+                Container(
+                  decoration: BoxDecoration(
+                    color: AppColors.card,
+                    borderRadius: BorderRadius.circular(16),
+                    border: Border.all(color: AppColors.cardBorder),
+                    boxShadow: [BoxShadow(color: Colors.black.withOpacity(0.04), blurRadius: 8, offset: const Offset(0, 2))],
+                  ),
+                  child: SwitchListTile(
+                    value: _antiSpoofEnabled,
+                    onChanged: (v) => setState(() => _antiSpoofEnabled = v),
+                    activeColor: AppColors.accent,
+                    title: const Text('Anti-Spoof Detection',
+                        style: TextStyle(color: AppColors.textPrimary, fontSize: 14, fontWeight: FontWeight.w600)),
+                    subtitle: Text(
+                      _antiSpoofEnabled ? 'Liveness check enabled' : 'Disabled (testing mode)',
+                      style: const TextStyle(color: AppColors.textSecondary, fontSize: 12),
+                    ),
+                    contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 4),
+                  ),
+                ),
+                const SizedBox(height: 14),
                 _GroupTile(
                   icon: Icons.groups_outlined,
                   iconBg: AppColors.accent,

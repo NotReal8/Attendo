@@ -17,7 +17,13 @@ import '../services/app_log.dart';
 class AttendanceScreen extends StatefulWidget {
   final int? groupId;
   final String groupName;
-  const AttendanceScreen({super.key, this.groupId, this.groupName = 'All Students'});
+  final bool antiSpoofEnabled;
+  const AttendanceScreen({
+    super.key,
+    this.groupId,
+    this.groupName = 'All Students',
+    this.antiSpoofEnabled = true,
+  });
   @override
   State<AttendanceScreen> createState() => _AttendanceScreenState();
 }
@@ -204,6 +210,7 @@ class _AttendanceScreenState extends State<AttendanceScreen>
     _sessionDate  = AttendanceService.todayDate;
     _sessionLabel = AttendanceService.sessionLabel;
     appLog('=== Attendance session: $_sessionLabel ===');
+    appLog('[Attendance] antiSpoofEnabled=${widget.antiSpoofEnabled}');
     FaceWorker.instance.init();
     _liveness.init();
     _loadStudents();
@@ -454,6 +461,16 @@ class _AttendanceScreenState extends State<AttendanceScreen>
 
       if (confirmed) {
         appLog('[Attendance] Vote confirmed for ${best.name} ✅');
+
+        if (!widget.antiSpoofEnabled) {
+          appLog('[Attendance] Anti-spoof disabled — skipping liveness check');
+          _faceService.clearVotes(best.name);
+          if (mounted) setState(() {
+            _votingName = null; _voteCount = 0;
+          });
+          _markPresent(best.name, now);
+          return;
+        }
 
         if (mounted) setState(() => _livenessChecking = true);
 
