@@ -9,6 +9,7 @@ import '../services/database_service.dart';
 import '../services/attendance_service.dart';
 import 'register_student_screen.dart';
 import 'group_form_screen.dart';
+import '../services/enrollment_service.dart';
 
 class RosterScreen extends StatefulWidget {
   const RosterScreen({super.key});
@@ -70,7 +71,7 @@ class _RosterScreenState extends State<RosterScreen> {
       ),
     );
     if (confirmed != true) return;
-    await _db.deleteStudent(s.name);
+    await EnrollmentService().deleteStudent(s.name);
     _load();
   }
 

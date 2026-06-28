@@ -35,4 +35,4 @@ flutter:
   uses-material-design: true
   assets:
     - assets/models/
-    - assets/models/best_model_quantized.onnx
+    - assets/models/best_model.onnx
