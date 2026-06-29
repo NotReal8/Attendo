@@ -462,6 +462,8 @@ class _AttendanceScreenState extends State<AttendanceScreen>
       if (confirmed) {
         appLog('[Attendance] Vote confirmed for ${best.name} ✅');
 
+        _processing = false;   // ← add this line
+
         if (!widget.antiSpoofEnabled) {
           appLog('[Attendance] Anti-spoof disabled — skipping liveness check');
           _faceService.clearVotes(best.name);
@@ -546,7 +548,7 @@ class _AttendanceScreenState extends State<AttendanceScreen>
       appLog('[Frame] ERROR: $e');
       appLog('[Frame] ${st.toString().split('\n').take(3).join(' | ')}');
     } finally {
-      _processing = false;
+      if (_processing) _processing = false;  // only clears if not already cleared
     }
   }
 
