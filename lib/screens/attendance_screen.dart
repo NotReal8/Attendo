@@ -462,6 +462,8 @@ class _AttendanceScreenState extends State<AttendanceScreen>
       if (confirmed) {
         appLog('[Attendance] Vote confirmed for ${best.name} ✅');
 
+        _processing = false; // ← ADD THIS — allow new frames to update _latestJpeg
+
         if (!widget.antiSpoofEnabled) {
           appLog('[Attendance] Anti-spoof disabled — skipping liveness check');
           _faceService.clearVotes(best.name);
